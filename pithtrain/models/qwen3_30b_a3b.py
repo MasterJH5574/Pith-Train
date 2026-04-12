@@ -181,12 +181,27 @@ class Qwen3MoeExperts(nn.Module):
         grouped_mm_offs: torch.Tensor,
         ks: list | None = None,
         ks_tensor: torch.Tensor | None = None,
+        _do_mem: bool = False,
     ) -> torch.Tensor:
+        from pithtrain.dualpipe.modeling import _lmem
+
         gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
         kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=gi)
+        if _do_mem:
+            _lmem(f"    experts: before gate_proj  x={tuple(x.shape)}")
         g = self.act_fn(self.gate_proj(x, **kwargs))
+        if _do_mem:
+            _lmem(f"    experts: after gate+silu   g={tuple(g.shape)}")
         u = self.up_proj(x, **kwargs)
-        return self.down_proj(g * u, **kwargs)
+        if _do_mem:
+            _lmem(f"    experts: after up_proj     u={tuple(u.shape)}")
+        gu = g * u
+        if _do_mem:
+            _lmem(f"    experts: after g*u         gu={tuple(gu.shape)}")
+        out = self.down_proj(gu, **kwargs)
+        if _do_mem:
+            _lmem(f"    experts: after down_proj   out={tuple(out.shape)}")
+        return out
 
 
 class Qwen3MoeGate(nn.Module):
@@ -533,7 +548,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
     ) -> ForwardAttnOutput:
         """LN + Attn + LN + Expert selection."""
+        from pithtrain.dualpipe.modeling import _layer_mem_profile, _lmem
+
+        _do = _layer_mem_profile and self.idx in (0, 5, 6)
+        if _do:
+            _lmem(f"  layer{self.idx} attn: before _forward_attn_compute")
         hidden_states, residual = self._forward_attn_compute(hidden_states)
+        if _do:
+            _lmem(f"  layer{self.idx} attn: after _forward_attn_compute (LN+Attn+LN)")
 
         if isinstance(self.mlp, Qwen3MoeMLP):
             return ForwardAttnOutput(
@@ -547,6 +569,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
 
         topk_ids, topk_weight = self.mlp.gate(hidden_states)
+        if _do:
+            _lmem(f"  layer{self.idx} attn: after gate")
         (
             sorted_tokens,
             idxs,
@@ -564,6 +588,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
             self.mlp.experts_per_rank,
             self.mlp.ep_group,
         )
+        if _do:
+            _lmem(
+                f"  layer{self.idx} attn: after dispatch_prep  sorted={tuple(sorted_tokens.shape)}"
+            )
 
         return ForwardAttnOutput(
             sorted_tokens,
@@ -587,19 +615,41 @@ class Qwen3MoeDecoderLayer(nn.Module):
         """
         MLP/Expert forward.
         """
+        from pithtrain.dualpipe.modeling import _layer_mem_profile, _lmem
+
         if isinstance(self.mlp, Qwen3MoeMLP):
             assert expert_idxs is None
             return self.mlp(gathered_tokens)
 
+        _do = _layer_mem_profile and self.idx in (0, 5, 6)
+
         assert expert_idxs is not None
+        if _do:
+            _lmem(
+                f"  layer{self.idx} mlp: before expand_idx  gathered={tuple(gathered_tokens.shape)}"
+            )
         if expand_idx is not None:
             gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
+        if _do:
+            _lmem(
+                f"  layer{self.idx} mlp: after expand_idx   expanded={tuple(gathered_tokens.shape)}"
+            )
         output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = (
             scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank)
         )
         del gathered_tokens  # free expanded tokens; no longer needed after scatter
-        outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
+        if _do:
+            _lmem(
+                f"  layer{self.idx} mlp: after scatter      output_tokens={tuple(output_tokens.shape)}"
+            )
+        outs = self.mlp.experts(
+            output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, _do_mem=_do
+        )
+        if _do:
+            _lmem(f"  layer{self.idx} mlp: after experts      outs={tuple(outs.shape)}")
         outs = padded_index_gather(outs, reverse_shuffle_idxs)
+        if _do:
+            _lmem(f"  layer{self.idx} mlp: after unshuffle    outs={tuple(outs.shape)}")
         return outs
 
     @torch.compile(fullgraph=True)
@@ -807,10 +857,14 @@ class Qwen3MoeModel(nn.Module):
                 hidden_states = self.lm_head(hidden_states)
             return hidden_states
 
+        from pithtrain.dualpipe.modeling import _layer_mem_profile, _lmem
+
         layer_idx = 0
         if self.embed_tokens is not None:
             intermediate_tensors.prolog.args = PrologArgs()
             intermediate_tensors.prolog.outs = PrologOuts(hidden_states)
+            if _layer_mem_profile:
+                _lmem("after prolog (embed_tokens)")
 
         for _, layer in self.layers.items():
             ret = decoder_layer_forward(layer, hidden_states)
@@ -833,11 +887,17 @@ class Qwen3MoeModel(nn.Module):
 
         if self.norm is not None:
             assert self.lm_head is not None
+            if _layer_mem_profile:
+                _lmem("before epilog (norm + lm_head)")
             if not ModelImplMode.use_reference_fwd:
                 hidden_states = hidden_states.detach().requires_grad_()
             intermediate_tensors.epilog.args = EpilogArgs(hidden_states)
             hidden_states = self.norm(hidden_states)
+            if _layer_mem_profile:
+                _lmem("after norm, before lm_head")
             hidden_states = self.lm_head(hidden_states)
+            if _layer_mem_profile:
+                _lmem("after lm_head")
 
         return hidden_states
 

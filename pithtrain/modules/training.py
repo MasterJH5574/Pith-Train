@@ -303,6 +303,23 @@ def apply_fsdp(model, mesh: torch.distributed.DeviceMesh):
     return model
 
 
+def _setup_mem(label: str) -> None:
+    """Print CUDA memory at a setup checkpoint (rank 0 only)."""
+    if torch.distributed.get_rank() in (3, 14):
+        torch.cuda.synchronize()
+        G = 1024**3
+        alloc = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        free, total = torch.cuda.mem_get_info()
+        cached = reserved - alloc
+        non_pytorch = total - free - reserved
+        print(
+            f"[rank={torch.distributed.get_rank()}] setup_model | {label}: "
+            f"alloc={alloc / G:.2f} cached={cached / G:.2f} non-pt={non_pytorch / G:.2f}",
+            flush=True,
+        )
+
+
 def setup_model(cfg: TrainingCfg, ctx: TrainingCtx, distributed: DistributedCtx) -> None:
     from pithtrain.dualpipe.utils import FP8WeightCacheControl
     from pithtrain.layers.factory import ModelImplMode
@@ -334,6 +351,8 @@ def setup_model(cfg: TrainingCfg, ctx: TrainingCtx, distributed: DistributedCtx)
     cp_group = device_mesh.get_group("cp") if cp_size > 1 else None
     ep_group = device_mesh.get_group("ep")
 
+    _setup_mem("before model creation")
+
     modules = []
     module_config = AutoConfig.from_pretrained(cfg.model)
     module_config.ep_size = ep_size
@@ -357,19 +376,23 @@ def setup_model(cfg: TrainingCfg, ctx: TrainingCtx, distributed: DistributedCtx)
     modules.append(
         ModelClass(module_config, pp_size * 2, pp_rank, ep_group=ep_group, **model_kwargs)
     )
+    _setup_mem("after module[0] creation")
     modules.append(
         ModelClass(
             module_config, pp_size * 2, pp_size * 2 - 1 - pp_rank, ep_group=ep_group, **model_kwargs
         )
     )
+    _setup_mem("after module[1] creation")
 
     # Apply scaled normal weight initialization before FSDP sharding.
     num_layers = module_config.num_hidden_layers
     for module in modules:
         init_weights(module, num_layers, cfg.init_std)
+    _setup_mem("after init_weights")
 
     modules = nn.Sequential(*modules)
     apply_fsdp(modules, device_mesh)
+    _setup_mem("after apply_fsdp")
 
     local_seq_len = cfg.sequence_length // cp_size
     # sequence_length = cfg.sequence_length, TODO this is kept here for stripe context parallelism

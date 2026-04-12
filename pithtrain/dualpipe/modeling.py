@@ -25,6 +25,70 @@ from pithtrain.layers.factory import ModelImplMode
 from pithtrain.models.interface import DecoderLayerProtocol
 from pithtrain.operators.all_to_all import direct_all_to_all
 
+# ── Per-layer activation profiling ──
+_layer_mem_profile = False
+_layer_mem_ranks = {3, 14}
+
+
+class _SavedTensorsProfiler:
+    """Context manager that logs tensors saved by autograd, distinguishing weights from activations."""
+
+    def __init__(self, layer_idx: int, stage_name: str, weight_data_ptrs: set):
+        self._layer_idx = layer_idx
+        self._stage_name = stage_name
+        self._weight_data_ptrs = weight_data_ptrs
+        self._log: list[str] = []
+        self._act_bytes = 0
+        self._wt_bytes = 0
+
+    def _pack(self, t: torch.Tensor) -> torch.Tensor:
+        nbytes = t.nelement() * t.element_size()
+        is_wt = t.data_ptr() in self._weight_data_ptrs
+        tag = "weight" if is_wt else "activ"
+        self._log.append(
+            f"    saved ({tag}): {tuple(t.shape)} {t.dtype} ({nbytes / 1024**2:.1f} MB)"
+        )
+        if is_wt:
+            self._wt_bytes += nbytes
+        else:
+            self._act_bytes += nbytes
+        return t
+
+    def __enter__(self):
+        self._ctx = torch.autograd.graph.saved_tensors_hooks(self._pack, lambda t: t)
+        self._ctx.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        self._ctx.__exit__(*args)
+
+    def print_summary(self):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank not in _layer_mem_ranks:
+            return
+        hdr = f"layer{self._layer_idx} {self._stage_name} saved tensors"
+        print(f"[rank={rank}] {hdr}:", flush=True)
+        for line in self._log:
+            print(f"[rank={rank}] {line}", flush=True)
+        print(
+            f"[rank={rank}]   activ={self._act_bytes / 1024**2:.1f} MB, "
+            f"weight={self._wt_bytes / 1024**2:.1f} MB, "
+            f"total={len(self._log)} tensors",
+            flush=True,
+        )
+
+
+def _lmem(label: str) -> None:
+    """Print memory at a layer-internal checkpoint."""
+    if not _layer_mem_profile:
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if rank not in _layer_mem_ranks:
+        return
+    torch.cuda.synchronize()
+    alloc = torch.cuda.memory_allocated() / 1024**3
+    print(f"[rank={rank}]   {label}: alloc={alloc:.2f}", flush=True)
+
 
 def decoder_layer_forward_dispatch(
     sorted_tokens: torch.Tensor,
@@ -86,15 +150,30 @@ def decoder_layer_forward(
         )
 
     intermediate_tensors = IntermediateTensorsLayer()
+    _do_lmem = _layer_mem_profile and layer.idx in (0, 5, 6)
+    _do_saved = _layer_mem_profile and layer.idx in (5, 6)
+
+    # Collect weight data_ptrs for distinguishing weights from activations in saved tensor logs.
+    _wt_ptrs: set = set()
+    if _do_saved:
+        _wt_ptrs = {p.data_ptr() for p in layer.parameters()}
 
     # Stage 1.
     nvtx.range_push("layer%02d.stage1_f" % layer.idx)
+    if _do_lmem:
+        _lmem(f"layer{layer.idx} before stage1 (forward_attn)")
     record = Stage1Record()
     prev_hidden_states = hidden_states
     next_hidden_states = hidden_states.detach().requires_grad_()
     record.args = Stage1Args(prev_hidden_states, next_hidden_states)
 
-    output = layer.forward_attn(next_hidden_states)
+    if _do_saved:
+        _prof = _SavedTensorsProfiler(layer.idx, "stage1", _wt_ptrs)
+        with _prof:
+            output = layer.forward_attn(next_hidden_states)
+        _prof.print_summary()
+    else:
+        output = layer.forward_attn(next_hidden_states)
     (
         sorted_tokens,
         moe_local_idxs,
@@ -117,6 +196,8 @@ def decoder_layer_forward(
         record.outs = Stage1OutsMlp(output.sorted_tokens, output.residual)
     intermediate_tensors.stage1 = record
     nvtx.range_pop()
+    if _do_lmem:
+        _lmem(f"layer{layer.idx} after stage1 (forward_attn + gate + dispatch_prep)")
 
     # Stage 2.
     nvtx.range_push("layer%02d.stage2_f" % layer.idx)
@@ -128,6 +209,8 @@ def decoder_layer_forward(
     setattr(gathered_tokens, "comm_work", None)
     intermediate_tensors.stage2 = record
     nvtx.range_pop()
+    if _do_lmem:
+        _lmem(f"layer{layer.idx} after stage2 (dispatch a2a)")
 
     # Stage 3.
     nvtx.range_push("layer%02d.stage3_f" % layer.idx)
@@ -144,7 +227,13 @@ def decoder_layer_forward(
     if has_experts and fwd_comm_work is not None:
         sorted_tokens.untyped_storage().resize_(0)
 
-    moe_outs = layer.forward_mlp(gathered_tokens, expert_idxs, expand_idx)
+    if _do_saved:
+        _prof = _SavedTensorsProfiler(layer.idx, "stage3", _wt_ptrs)
+        with _prof:
+            moe_outs = layer.forward_mlp(gathered_tokens, expert_idxs, expand_idx)
+        _prof.print_summary()
+    else:
+        moe_outs = layer.forward_mlp(gathered_tokens, expert_idxs, expand_idx)
 
     record.outs = Stage3Outs(moe_outs)
     # Free args storage — values no longer needed, only .grad is read after backward.
@@ -155,6 +244,8 @@ def decoder_layer_forward(
         gathered_tokens.untyped_storage().resize_(0)
     intermediate_tensors.stage3 = record
     nvtx.range_pop()
+    if _do_lmem:
+        _lmem(f"layer{layer.idx} after stage3 (forward_mlp)")
 
     # Stage 4.
     nvtx.range_push("layer%02d.stage4_f" % layer.idx)
@@ -166,6 +257,8 @@ def decoder_layer_forward(
     setattr(moe_outs, "comm_work", None)
     intermediate_tensors.stage4 = record
     nvtx.range_pop()
+    if _do_lmem:
+        _lmem(f"layer{layer.idx} after stage4 (combine a2a)")
 
     # Stage 5.
     nvtx.range_push("layer%02d.stage5_f" % layer.idx)
@@ -180,11 +273,19 @@ def decoder_layer_forward(
     # Stage 4 all-to-all has completed — Stage 3 output is no longer read.
     if has_experts and fwd_comm_work is not None:
         intermediate_tensors.stage3.outs.moe_outs.untyped_storage().resize_(0)
-    hidden_states = layer.forward_aggregate(moe_outs, moe_local_idxs, topk_weight, residual)
+    if _do_saved:
+        _prof = _SavedTensorsProfiler(layer.idx, "stage5", _wt_ptrs)
+        with _prof:
+            hidden_states = layer.forward_aggregate(moe_outs, moe_local_idxs, topk_weight, residual)
+        _prof.print_summary()
+    else:
+        hidden_states = layer.forward_aggregate(moe_outs, moe_local_idxs, topk_weight, residual)
 
     record.outs = Stage5Outs(hidden_states)
     intermediate_tensors.stage5 = record
     nvtx.range_pop()
+    if _do_lmem:
+        _lmem(f"layer{layer.idx} after stage5 (forward_aggregate)")
 
     return hidden_states, intermediate_tensors
 

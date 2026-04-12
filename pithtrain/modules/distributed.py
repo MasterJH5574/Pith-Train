@@ -140,12 +140,30 @@ def setup_default_process_group(cfg: DistributedCfg, ctx: DistributedCtx) -> Non
     ctx.local_rank = int(os.environ["LOCAL_RANK"])
     ctx.local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
 
+    # Probe: isolate CUDA context cost from NCCL communicator init
+    torch.cuda.set_device(ctx.local_rank)
+    torch.cuda.synchronize()
+    _free0, _total = torch.cuda.mem_get_info()
+    _non_pt0 = _total - _free0
+    G = 1024**3
+
     kwargs = dict()
     kwargs["backend"] = "nccl"
     kwargs["device_id"] = ctx.local_rank
     torch.distributed.init_process_group(**kwargs)
     atexit.register(torch.distributed.destroy_process_group)
-    torch.cuda.set_device(ctx.local_rank)
+
+    torch.cuda.synchronize()
+    _free1, _ = torch.cuda.mem_get_info()
+    _non_pt1 = _total - _free1
+    if ctx.local_rank in (3, 14):
+        print(
+            f"[rank={ctx.rank}] init_process_group | "
+            f"cuda_ctx={_non_pt0 / G:.2f} "
+            f"after_nccl_world={_non_pt1 / G:.2f} "
+            f"nccl_world_cost={(_non_pt1 - _non_pt0) / G:.2f}",
+            flush=True,
+        )
 
 
 def setup_device_mesh(cfg: DistributedCfg, ctx: DistributedCtx) -> None:
@@ -167,11 +185,27 @@ def setup_device_mesh(cfg: DistributedCfg, ctx: DistributedCtx) -> None:
     ctx.cp_size = cfg.context_parallel_size
     ctx.dp_size = ctx.world_size // (ctx.ep_size * ctx.pp_size * ctx.cp_size)
 
+    torch.cuda.synchronize()
+    _free_before, _total = torch.cuda.mem_get_info()
+    _non_pt_before = _total - _free_before
+
     kwargs = dict()
     kwargs["device_type"] = "cuda"
     kwargs["mesh_shape"] = (ctx.pp_size, ctx.dp_size, ctx.cp_size, ctx.ep_size)
     kwargs["mesh_dim_names"] = ("pp", "dp", "cp", "ep")
     ctx.device_mesh = torch.distributed.init_device_mesh(**kwargs)
+
+    torch.cuda.synchronize()
+    _free_after, _ = torch.cuda.mem_get_info()
+    _non_pt_after = _total - _free_after
+    G = 1024**3
+    if ctx.local_rank in (3, 14):
+        print(
+            f"[rank={ctx.rank}] init_device_mesh | "
+            f"non-pt={_non_pt_after / G:.2f} "
+            f"mesh_cost={(_non_pt_after - _non_pt_before) / G:.2f}",
+            flush=True,
+        )
 
     ctx.dp_rank = ctx.device_mesh.get_local_rank("dp")
     ctx.pp_rank = ctx.device_mesh.get_local_rank("pp")

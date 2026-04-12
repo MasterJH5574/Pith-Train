@@ -36,6 +36,22 @@ from pithtrain.dualpipe.overlap import overlapped_forward_backward
 from pithtrain.dualpipe.utils import FP8WeightCacheControl, WeightGradStore, gather, scatter
 
 
+def _mem_gb() -> float:
+    """Return current CUDA memory allocated in GiB."""
+    return torch.cuda.memory_allocated() / 1024**3
+
+
+def _mem_detail() -> str:
+    """Return allocated, cached-pool, and non-pytorch memory in GiB."""
+    free, total = torch.cuda.mem_get_info()
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    G = 1024**3
+    cached = reserved - allocated
+    non_pytorch = total - free - reserved
+    return f"alloc={allocated / G:.2f} cached={cached / G:.2f} non-pt={non_pytorch / G:.2f}"
+
+
 class DualPipeV(nn.Module):
     """V-shaped bidirectional pipeline parallelism scheduler.
 
@@ -80,6 +96,8 @@ class DualPipeV(nn.Module):
         self.is_last_pp_rank = self.pp_rank == self.pp_size - 1
 
         self.comm_stream = torch.cuda.Stream(device=device)
+
+        self.memory_profiling = True  # Set to True to enable per-step memory logging
 
         # Pre-allocation tracking
         self._num_chunks_allocated = 0
@@ -476,27 +494,117 @@ class DualPipeV(nn.Module):
             self.labels = scatter(labels, num_chunks, self.batch_dim)
             self.criterion = criterion
 
+        _profiling = self.memory_profiling and self.rank in (3, 14)
+        if _profiling:
+            torch.cuda.synchronize()
+            _m0 = _mem_gb()
+            print(
+                f"[rank={self.rank} pp={pp_rank}] Before pipeline: {_m0:.2f} GiB | {_mem_detail()}",
+                flush=True,
+            )
+
         # Step 1: nF0
         step_1 = (pp_size - pp_rank - 1) * 2
         for i in range(step_1):
+            # Enable per-layer profiling for the first F0 chunk only
+            if _profiling and i == 1:
+                import pithtrain.dualpipe.modeling as _mod
+
+                _mod._layer_mem_profile = True
             self._forward_chunk(0)
+            if _profiling and i == 1:
+                _mod._layer_mem_profile = False
+            if _profiling:
+                torch.cuda.synchronize()
+                print(
+                    f"[rank={self.rank} pp={pp_rank}] Step1 F0 i={i}: {_mem_gb():.2f} GiB (+{_mem_gb() - _m0:.2f}) | {_mem_detail()}",
+                    flush=True,
+                )
+
+        if _profiling:
+            torch.cuda.synchronize()
+            _m1 = _mem_gb()
+            print(
+                f"[rank={self.rank} pp={pp_rank}] After Step1 ({step_1} F0): {_m1:.2f} GiB (+{_m1 - _m0:.2f}) | {_mem_detail()}",
+                flush=True,
+            )
 
         # Step 2: nF0F1
         step_2 = pp_rank + 1
         self._recv_forward(0)
         for i in range(step_2):
             self._forward_chunk(0, recv=False, send=False)
+            if _profiling:
+                torch.cuda.synchronize()
+                print(
+                    f"[rank={self.rank} pp={pp_rank}] Step2 i={i} forward_chunk(0): {_mem_gb():.2f} GiB (+{_mem_gb() - _m0:.2f}) | {_mem_detail()}",
+                    flush=True,
+                )
             self._recv_forward(0)
+            # Enable per-layer profiling for the first F1 chunk
+            if _profiling and i == 0:
+                import pithtrain.dualpipe.modeling as _mod
+
+                _mod._layer_mem_profile = True
             self._forward_chunk(1, send=(not self.is_last_pp_rank) or (i < step_2 - 1))
+            if _profiling and i == 0:
+                _mod._layer_mem_profile = False
+            if _profiling:
+                torch.cuda.synchronize()
+                print(
+                    f"[rank={self.rank} pp={pp_rank}] Step2 i={i} forward_chunk(1): {_mem_gb():.2f} GiB (+{_mem_gb() - _m0:.2f}) | {_mem_detail()}",
+                    flush=True,
+                )
             self._send_forward(0)
+
+        if _profiling:
+            torch.cuda.synchronize()
+            _m2 = _mem_gb()
+            print(
+                f"[rank={self.rank} pp={pp_rank}] After Step2 ({step_2} F0F1): {_m2:.2f} GiB (+{_m2 - _m0:.2f}) | {_mem_detail()}",
+                flush=True,
+            )
 
         # Step 3: nB1W1F1 (Use zero bubble)
         step_3 = pp_size - pp_rank - 1
         for i in range(step_3):
+            if _profiling:
+                torch.cuda.synchronize()
+                _ms3 = _mem_gb()
+                print(
+                    f"[rank={self.rank} pp={pp_rank}] Step3 i={i} before B1: {_ms3:.2f} GiB | {_mem_detail()}",
+                    flush=True,
+                )
             self._backward_chunk(1, enable_zb=True)
+            if _profiling:
+                torch.cuda.synchronize()
+                print(
+                    f"[rank={self.rank} pp={pp_rank}] Step3 i={i} after B1: {_mem_gb():.2f} GiB (delta={_mem_gb() - _ms3:+.2f}) | {_mem_detail()}",
+                    flush=True,
+                )
             self._recv_forward(1)
             self._weight_chunk()
+            if _profiling:
+                torch.cuda.synchronize()
+                print(
+                    f"[rank={self.rank} pp={pp_rank}] Step3 i={i} after W1: {_mem_gb():.2f} GiB (delta={_mem_gb() - _ms3:+.2f}) | {_mem_detail()}",
+                    flush=True,
+                )
             self._forward_chunk(1, recv=False)
+            if _profiling:
+                torch.cuda.synchronize()
+                print(
+                    f"[rank={self.rank} pp={pp_rank}] Step3 i={i} after F1: {_mem_gb():.2f} GiB (delta={_mem_gb() - _ms3:+.2f}) | {_mem_detail()}",
+                    flush=True,
+                )
+
+        if _profiling:
+            torch.cuda.synchronize()
+            _m3 = _mem_gb()
+            print(
+                f"[rank={self.rank} pp={pp_rank}] After Step3 ({step_3} B1W1F1): {_m3:.2f} GiB (+{_m3 - _m0:.2f}) | {_mem_detail()}",
+                flush=True,
+            )
 
         # Step 4 (Main step): nF0B1F1B0
         step_4 = num_chunks - pp_size * 2 + pp_rank + 1
@@ -514,6 +622,20 @@ class DualPipeV(nn.Module):
             else:
                 self._forward_backward_chunk(0, 1)
             self._forward_backward_chunk(1, 0)
+            if _profiling:
+                torch.cuda.synchronize()
+                print(
+                    f"[rank={self.rank} pp={pp_rank}] Step4 i={i}: {_mem_gb():.2f} GiB | {_mem_detail()}",
+                    flush=True,
+                )
+
+        if _profiling:
+            torch.cuda.synchronize()
+            _m4 = _mem_gb()
+            print(
+                f"[rank={self.rank} pp={pp_rank}] After Step4 ({step_4} F0B1F1B0): {_m4:.2f} GiB | {_mem_detail()}",
+                flush=True,
+            )
 
         # Step 5: nB1F1B0
         step_5 = pp_size - pp_rank - 1
@@ -543,6 +665,14 @@ class DualPipeV(nn.Module):
         for i in range(step_8):
             self._weight_chunk()
         assert WeightGradStore.funcs_queue.empty()
+
+        if _profiling:
+            torch.cuda.synchronize()
+            _m8 = _mem_gb()
+            print(
+                f"[rank={self.rank} pp={pp_rank}] After Step8 (end of pipeline): {_m8:.2f} GiB | {_mem_detail()}",
+                flush=True,
+            )
 
         self._commit_and_wait_comm()
 

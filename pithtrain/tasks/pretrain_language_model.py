@@ -337,6 +337,27 @@ def load_checkpoint(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx
     app_state = AppState(model, optimizer, scheduler, model_only=model_only)
     dcp.load({"app": app_state}, checkpoint_id=load_location)
     rank = torch.distributed.get_rank()
+    if rank in (3, 14):
+        torch.cuda.synchronize()
+        optim_mem = sum(
+            (s._local_tensor if isinstance(s, DTensor) else s).nelement()
+            * (s._local_tensor if isinstance(s, DTensor) else s).element_size()
+            for state in optimizer.state.values()
+            for s in state.values()
+            if isinstance(s, torch.Tensor)
+        )
+        G = 1024**3
+        alloc = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        free, total = torch.cuda.mem_get_info()
+        cached = reserved - alloc
+        non_pytorch = total - free - reserved
+        print(
+            f"[rank={rank}] load_ckpt | optimizer state: {optim_mem / G:.2f} GiB "
+            f"({len(optimizer.state)} param entries) | "
+            f"alloc={alloc / G:.2f} cached={cached / G:.2f} non-pt={non_pytorch / G:.2f}",
+            flush=True,
+        )
     rng_path = Path(load_location, "rng-rank-%05d.pt" % rank)
     if rng_path.exists():
         rng_state = torch.load(rng_path, weights_only=True)
@@ -371,6 +392,14 @@ def train_step(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> 
     scheduler = ctx.training.scheduler
     model.train()
 
+    # ── Memory profiling (first step only) ──
+    _mem_profile = ctx.training.step == 0
+    _mem_snapshot = _mem_profile and torch.distributed.get_rank() in (3, 14)
+    if _mem_profile:
+        model.memory_profiling = True  # model is DualPipeV
+    if _mem_snapshot:
+        torch.cuda.memory._record_memory_history(max_entries=1048576)
+
     dp_size = ctx.distributed.dp_size
     ep_size = ctx.distributed.ep_size
     micro_batch_size = cfg.training.micro_batch_size
@@ -382,13 +411,39 @@ def train_step(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> 
     global_tokens, global_labels = get_global_batch(cfg, ctx, device)
 
     # Run the forward and backward pass.
-    loss, _ = model.step(
-        global_tokens,
-        num_chunks=accumulate_steps,
-        criterion=criterion,
-        labels=(global_labels,),
-        return_outputs=False,
-    )
+    try:
+        loss, _ = model.step(
+            global_tokens,
+            num_chunks=accumulate_steps,
+            criterion=criterion,
+            labels=(global_labels,),
+            return_outputs=False,
+        )
+    except torch.OutOfMemoryError:
+        if _mem_snapshot:
+            snapshot = torch.cuda.memory._snapshot()
+            from pickle import dump
+
+            snapshot_path = f"/tmp/memory_snapshot_rank{torch.distributed.get_rank()}.pickle"
+            with open(snapshot_path, "wb") as f:
+                dump(snapshot, f)
+            print(f"[rank={torch.distributed.get_rank()}] Memory snapshot saved to {snapshot_path}")
+            torch.cuda.memory._record_memory_history(enabled=None)
+        raise
+
+    if _mem_snapshot:
+        snapshot = torch.cuda.memory._snapshot()
+        from pickle import dump
+
+        snapshot_path = f"/tmp/memory_snapshot_rank{torch.distributed.get_rank()}_step0.pickle"
+        with open(snapshot_path, "wb") as f:
+            dump(snapshot, f)
+        print(f"[rank={torch.distributed.get_rank()}] Memory snapshot saved to {snapshot_path}")
+        torch.cuda.memory._record_memory_history(enabled=None)
+
+    if _mem_profile:
+        if hasattr(model, "memory_profiling"):
+            model.memory_profiling = False
 
     # Average loss across CP ranks for correct logging.
     cp_size = ctx.distributed.cp_size
