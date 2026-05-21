@@ -13,10 +13,12 @@ from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
 from pithtrain.dualpipe.utils import run_backward
 from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
-from pithtrain.models.interface import ForwardAttnOutput
+from pithtrain.models.interface import ForwardAttnOutput, needs_ep_prepare_dispatch
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
+from pithtrain.operators.ep_backend import is_deepep_dispatch_state
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
+from pithtrain.operators.recv_idx_filter import prepare_dispatch_indices
 from pithtrain.operators.ring_attention import ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
@@ -24,6 +26,7 @@ from pithtrain.operators.token_scatter import (
     precompute_group_indices,
     scatter_for_grouped_gemm,
 )
+from pithtrain.operators.weighted_scatter import weighted_scatter_combine
 
 torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
 
@@ -529,35 +532,41 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
 
         topk_ids, topk_weight = self.mlp.gate(hidden_states)
-        (
-            sorted_tokens,
-            idxs,
-            expert_idxs,
-            expand_idx,
-            dedup_input_splits,
-            dedup_output_splits,
-            input_splits,
-            output_splits,
-        ) = moe_ep_prepare_dispatch(
-            hidden_states,
-            topk_ids,
-            self.mlp.num_experts,
-            self.mlp.ep_size,
-            self.mlp.experts_per_rank,
-            self.mlp.ep_group,
-        )
-
+        if needs_ep_prepare_dispatch(self):
+            (
+                sorted_tokens,
+                idxs,
+                expert_idxs,
+                expand_idx,
+                dedup_input_splits,
+                dedup_output_splits,
+                input_splits,
+                output_splits,
+            ) = moe_ep_prepare_dispatch(
+                hidden_states,
+                topk_ids,
+                self.mlp.num_experts,
+                self.mlp.ep_size,
+                self.mlp.experts_per_rank,
+                self.mlp.ep_group,
+            )
+        else:
+            sorted_tokens = idxs = expert_idxs = expand_idx = None
+            dedup_input_splits = dedup_output_splits = None
+            input_splits = output_splits = None
         return ForwardAttnOutput(
-            sorted_tokens,
-            idxs,
-            topk_weight,
-            output_splits,
-            input_splits,
-            expert_idxs,
-            residual,
-            expand_idx,
-            dedup_input_splits,
-            dedup_output_splits,
+            sorted_tokens=sorted_tokens,
+            moe_local_idxs=idxs,
+            topk_weight=topk_weight,
+            output_splits=output_splits,
+            input_splits=input_splits,
+            expert_idxs=expert_idxs,
+            residual=residual,
+            expand_idx=expand_idx,
+            dedup_input_splits=dedup_input_splits,
+            dedup_output_splits=dedup_output_splits,
+            hidden_states_post_attn=hidden_states,
+            topk_ids=topk_ids,
         )
 
     def forward_mlp(
@@ -565,11 +574,20 @@ class Qwen3MoeDecoderLayer(nn.Module):
         gathered_tokens: torch.Tensor,
         expert_idxs: Optional[torch.Tensor] = None,
         expand_idx: Optional[torch.Tensor] = None,
+        dispatch_state: Optional[dict] = None,
     ) -> torch.Tensor:
-        """MLP/Expert forward."""
+        """MLP forward (stage 3 compute). See DeepseekV2LiteDecoderLayer.forward_mlp."""
         if isinstance(self.mlp, Qwen3MoeMLP):
-            assert expert_idxs is None
+            assert expert_idxs is None and dispatch_state is None
             return self.mlp(gathered_tokens)
+
+        deepep_path = is_deepep_dispatch_state(dispatch_state)
+        if deepep_path:
+            expand_idx, k_idx, expert_idxs, n_recv = prepare_dispatch_indices(
+                dispatch_state["recv_topk_idx"]
+            )
+            rtw_leaf = dispatch_state["recv_topk_weights"].detach().requires_grad_()
+            dispatch_state["recv_topk_weights_leaf"] = rtw_leaf
 
         assert expert_idxs is not None
         if expand_idx is not None:
@@ -577,12 +595,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
         output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = (
             scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank)
         )
-        del gathered_tokens  # free expanded tokens; no longer needed after scatter
+        del gathered_tokens
         outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
         outs = padded_index_gather(outs, reverse_shuffle_idxs)
+
+        if deepep_path:
+            return weighted_scatter_combine(outs, rtw_leaf, expand_idx, k_idx, n_recv)
         return outs
 
-    @torch.compile(fullgraph=True)
     def forward_aggregate(
         self,
         moe_outs: torch.Tensor,
@@ -590,7 +610,22 @@ class Qwen3MoeDecoderLayer(nn.Module):
         topk_weight: Optional[torch.Tensor],
         residual: torch.Tensor,
     ) -> torch.Tensor:
-        """Weighted expert output + residual connection."""
+        """Weighted expert output + residual. For the deepep backend (ep_size>1
+        with moe_local_idxs=None), moe_outs is already weighted, so this is just
+        a residual add."""
+        if isinstance(self.mlp, Qwen3MoeMoE) and self.mlp.ep_size > 1 and moe_local_idxs is None:
+            return residual + moe_outs.view(*residual.shape)
+        return self._forward_aggregate_torch(moe_outs, moe_local_idxs, topk_weight, residual)
+
+    @torch.compile(fullgraph=True)
+    def _forward_aggregate_torch(
+        self,
+        moe_outs: torch.Tensor,
+        moe_local_idxs: Optional[torch.Tensor],
+        topk_weight: Optional[torch.Tensor],
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """Torch backend: weighted-sum across K + residual."""
         if isinstance(self.mlp, Qwen3MoeMoE):
             if self.mlp.ep_size > 1:
                 assert moe_local_idxs is not None

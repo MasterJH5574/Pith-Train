@@ -399,7 +399,23 @@ def setup_model(
                     if cp_group is not None:
                         gate.compute = gate.compute.__wrapped__.__get__(gate, type(gate))
 
-    ctx.model = DualPipeV(modules, pp_group=pp_group, ep_group=ep_group)
+    from pithtrain.operators.ep_backend import make_ep_backend, resolve_ep_backend_kind
+
+    num_topk = getattr(
+        module_config, "num_experts_per_tok", getattr(module_config, "num_experts_per_token", 0)
+    )
+    num_experts = getattr(
+        module_config, "n_routed_experts", getattr(module_config, "num_experts", 0)
+    )
+    ep_backend = make_ep_backend(
+        resolve_ep_backend_kind("auto"),
+        ep_group,
+        num_max_tokens_per_rank=micro_batch_size * local_seq_len,
+        hidden=hidden_size,
+        num_topk=num_topk,
+        num_experts=num_experts,
+    )
+    ctx.model = DualPipeV(modules, pp_group=pp_group, ep_group=ep_group, ep_backend=ep_backend)
     set_p2p_tensor_shapes([(micro_batch_size, local_seq_len, hidden_size)])
     set_p2p_tensor_dtype(torch.bfloat16)
 

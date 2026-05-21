@@ -65,6 +65,12 @@ class DistributedCfg(SlottedDefault):
       across dp. Pick when one DP replica fits the model.
     """
 
+    ep_backend: Literal["auto", "deepep", "torch"] = "auto"
+    """EP all-to-all backend selection. "auto" picks deepep if available, else torch.
+
+    Override via env PITHTRAIN_EP_BACKEND=torch|deepep|auto.
+    """
+
 
 @dataclass(init=False, slots=True)
 class DistributedCtx:

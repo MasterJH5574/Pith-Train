@@ -12,6 +12,11 @@ dependencies = [
     "zstandard",
 ]
 
+# DeepEP v2 itself is installed post-`uv sync` by `scripts/install_deepep.sh`
+# (handles the libnccl.so SONAME symlink and multi-arch C++ build that uv sync
+# can't do alone). The NCCL override below is so `uv sync` already produces the
+# >=2.30.4 NCCL DeepEP needs at runtime — torch 2.12 otherwise pins it to 2.29.7.
+
 [dependency-groups]
 dev = ["pre-commit", "pytest", "ruff"]
 
@@ -23,6 +28,10 @@ requires = ["setuptools>=61"]
 include = ["pithtrain*"]
 
 [tool.uv]
+# DeepEP v2 needs NCCL >= 2.30.4 at runtime; torch 2.12 hard-pins
+# nvidia-nccl-cu13 == 2.29.7. NCCL is ABI-backward-compatible so torch keeps
+# working with the newer wheel.
+override-dependencies = ["nvidia-nccl-cu13>=2.30.4"]
 
 [[tool.uv.index]]
 name = "torch-cu130"

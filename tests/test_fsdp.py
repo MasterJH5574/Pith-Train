@@ -299,9 +299,22 @@ def main(ctx: DistributedCtx, model_name: str):
     apply_fsdp(local_modules, ctx.device_mesh, dtype)
 
     # Wrap the modules with DualPipeV.
+    from pithtrain.operators.ep_backend import make_ep_backend, resolve_ep_backend_kind
+
+    num_topk = getattr(config, "num_experts_per_tok", getattr(config, "num_experts_per_token", 0))
+    num_experts_cfg = getattr(config, "n_routed_experts", getattr(config, "num_experts", 0))
+    ep_backend = make_ep_backend(
+        resolve_ep_backend_kind("auto"),
+        ep_group,
+        num_max_tokens_per_rank=micro_batch_size * sequence_length,
+        hidden=hidden_size,
+        num_topk=num_topk,
+        num_experts=num_experts_cfg,
+    )
     kwargs = dict()
     kwargs["pp_group"] = pp_group
     kwargs["ep_group"] = ep_group
+    kwargs["ep_backend"] = ep_backend
     dualpipev_model = DualPipeV(local_modules, **kwargs)
 
     # Run the DualPipeV step.

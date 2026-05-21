@@ -10,14 +10,26 @@ Stage Mapping:
 """
 
 from dataclasses import dataclass
-from typing import List, NamedTuple, Optional, Union
+from typing import Any, List, NamedTuple, Optional, Union
 
 import torch
 import torch.cuda.nvtx as nvtx
 
+try:
+    import deep_ep
+except ImportError:
+    deep_ep = None
+
 from pithtrain.dualpipe.utils import WeightGradStore, run_backward
-from pithtrain.models.interface import DecoderLayerProtocol, ModelProtocol
+from pithtrain.models.interface import DecoderLayerProtocol, ModelProtocol, uses_deepep_dispatch
 from pithtrain.operators.all_to_all import direct_all_to_all
+from pithtrain.operators.ep_backend import (
+    DeepEPEventWork,
+    deepep_combine,
+    deepep_dispatch,
+    is_deepep_backend,
+    is_deepep_dispatch_state,
+)
 
 
 @dataclass(init=False, slots=True)
@@ -43,6 +55,10 @@ class ExecutionCtx:
     all-to-all in Stage 2 / Stage 4).  The subsequent stage that waits on
     fwd_comm_work drains and frees this list automatically.
     """
+    ep_backend: Optional[Any]
+    """EP backend dict (from make_ep_backend); None for the torch path."""
+    fwd_comm_prev_event: Optional[Any]
+    """Comp_stream snapshot after forward compute, consumed by forward-direction comm."""
 
 
 # ------------------------------------------------------------
@@ -87,9 +103,17 @@ def stage1_f(
 
     output = layer.forward_attn(next_hidden_states)
     ctx.comp_stream.record_event(ctx.fwd_event)
+    if is_deepep_backend(ctx.ep_backend):
+        ctx.fwd_comm_prev_event = deep_ep.EventHandle()
 
     if hasattr(layer.mlp, "experts"):
-        record.outs = Stage1OutsMoe(output.sorted_tokens, output.topk_weight, output.residual)
+        # deepep: backprop through hidden_states_post_attn (input to buf.dispatch).
+        # torch: backprop through sorted_tokens (input to direct_all_to_all).
+        record.outs = Stage1OutsMoe(
+            output.hidden_states_post_attn if uses_deepep_dispatch(layer) else output.sorted_tokens,
+            output.topk_weight,
+            output.residual,
+        )
     else:
         record.outs = Stage1OutsMlp(output.sorted_tokens, output.residual)
 
@@ -123,9 +147,10 @@ def stage1_b(
 # ------------------------------------------------------------
 
 
-@dataclass(init=False, slots=True)
+@dataclass(slots=True)
 class Stage2Record:
-    ctx: Optional[tuple]
+    a2a_ctx: Optional[tuple] = None
+    dispatch_state: Optional[dict] = None
 
 
 def stage2_f(
@@ -135,29 +160,50 @@ def stage2_f(
     output_splits: Optional[List[int]],
     input_splits: Optional[List[int]],
     ep_group: Optional[torch.distributed.ProcessGroup] = None,
+    expert_idxs: Optional[torch.Tensor] = None,
+    expand_idx: Optional[torch.Tensor] = None,
+    hidden_states_post_attn: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    topk_weight: Optional[torch.Tensor] = None,
 ):
-    """Stage2 forward: all-to-all dispatch for expert parallelism."""
+    """Stage2 forward: pure communication — all-to-all dispatch.
+    Returns (record, gathered_tokens, expert_idxs, expand_idx). On the deepep
+    path expert_idxs / expand_idx are None — forward_mlp computes them from
+    recv_topk_idx."""
     nvtx.range_push("layer%02d.stage2_f" % layer.idx)
     record = Stage2Record()
 
-    ctx.comm_stream.wait_event(ctx.fwd_event)
+    if uses_deepep_dispatch(layer):
+        # Stage 2/3 autograd boundary for activations is stage3_f's
+        # gathered_tokens.detach().requires_grad_(); for the routing weights
+        # the boundary is created inside forward_mlp.
+        recv_x, record.dispatch_state, ctx.fwd_comm_work = deepep_dispatch(
+            ctx.ep_backend,
+            hidden_states_post_attn,
+            topk_ids,
+            topk_weight,
+            comp_stream=ctx.comp_stream,
+            previous_event=ctx.fwd_comm_prev_event,
+        )
+        nvtx.range_pop()
+        return record, recv_x, None, None
 
+    ctx.comm_stream.wait_event(ctx.fwd_event)
     sorted_tokens = sorted_tokens.detach()
     if output_splits is not None:
         with torch.cuda.stream(ctx.comm_stream):
             gathered_tokens = direct_all_to_all(
                 sorted_tokens, output_splits, input_splits, ep_group
             )
-        record.ctx = (output_splits, input_splits, ep_group)
+        record.a2a_ctx = (output_splits, input_splits, ep_group)
     else:
         gathered_tokens = sorted_tokens
-        record.ctx = None
 
     ctx.fwd_comm_work = getattr(gathered_tokens, "comm_work", None)
     setattr(gathered_tokens, "comm_work", None)
 
     nvtx.range_pop()
-    return record, gathered_tokens
+    return record, gathered_tokens, expert_idxs, expand_idx
 
 
 def stage2_b(
@@ -166,13 +212,50 @@ def stage2_b(
     record: Stage2Record,
     grad_tensors: tuple,
 ):
-    """Stage2 backward: reverse all-to-all."""
+    """Stage2 backward: pure communication — reverse all-to-all.
+    Returns (hidden_states_grad, topk_weight_grad). topk_weight_grad is None
+    on the torch path (grad flows through stage5_b instead)."""
     nvtx.range_push("layer%02d.stage2_b" % layer.idx)
+
+    if is_deepep_dispatch_state(record.dispatch_state):
+        ep = ctx.ep_backend
+        buf = ep["buffer"]
+        dispatch_state = record.dispatch_state
+        grad_recv_x = grad_tensors[0]
+        rtw_leaf = dispatch_state["recv_topk_weights_leaf"]
+        if rtw_leaf is not None and rtw_leaf.requires_grad and rtw_leaf.grad is not None:
+            grad_recv_topk_weights = rtw_leaf.grad.contiguous()
+        else:
+            grad_recv_topk_weights = None
+
+        grad_h_flat, grad_tw_flat, ev = buf.combine(
+            grad_recv_x.contiguous(),
+            handle=dispatch_state["dispatch_handle"],
+            topk_weights=grad_recv_topk_weights,
+            num_sms=ep["num_sms"],
+            async_with_compute_stream=True,
+            allocate_on_comm_stream=True,
+        )
+        # Defer the wait: stage1_b in the next iteration calls bwd_comm_work.wait()
+        # before consuming. Letting comp_stream advance lets stage3_w overlap
+        # with this buf.combine.
+        grad_h_flat.record_stream(ctx.comp_stream)
+        if grad_tw_flat is not None:
+            grad_tw_flat.record_stream(ctx.comp_stream)
+        ctx.bwd_comm_work = DeepEPEventWork(ev)
+
+        h_grad = grad_h_flat.view(*dispatch_state["input_h_shape"])
+        if grad_tw_flat is not None and dispatch_state["input_tw_shape"] is not None:
+            tw_grad = grad_tw_flat.view(*dispatch_state["input_tw_shape"])
+        else:
+            tw_grad = None
+        nvtx.range_pop()
+        return h_grad, tw_grad
 
     ctx.comm_stream.wait_event(ctx.bwd_event)
 
-    if record.ctx is not None:
-        output_splits, input_splits, group = record.ctx
+    if record.a2a_ctx is not None:
+        output_splits, input_splits, group = record.a2a_ctx
         with torch.cuda.stream(ctx.comm_stream):
             sorted_tokens_grad = direct_all_to_all(
                 grad_tensors[0], input_splits, output_splits, group
@@ -184,7 +267,7 @@ def stage2_b(
         ctx.bwd_comm_work = None
 
     nvtx.range_pop()
-    return sorted_tokens_grad
+    return sorted_tokens_grad, None
 
 
 # ------------------------------------------------------------
@@ -219,8 +302,9 @@ def stage3_f(
     gathered_tokens: torch.Tensor,
     expert_idxs: Optional[torch.Tensor],
     expand_idx: Optional[torch.Tensor] = None,
+    dispatch_state: Optional[dict] = None,
 ):
-    """Stage3 forward."""
+    """Stage3 forward — pure compute. Dispatches to layer.forward_mlp."""
     nvtx.range_push("layer%02d.stage3_f" % layer.idx)
     record = Stage3Record()
 
@@ -231,7 +315,9 @@ def stage3_f(
         ctx.fwd_comm_work.wait()
     _drain_deferred_free(ctx)
 
-    moe_outs = layer.forward_mlp(gathered_tokens, expert_idxs, expand_idx)
+    moe_outs = layer.forward_mlp(
+        gathered_tokens, expert_idxs, expand_idx, dispatch_state=dispatch_state
+    )
     record.outs = Stage3Outs(moe_outs)
     # Free the args storage - only safe for MoE layers with EP where
     # padded_index_gather is the first consumer and doesn't save the input.
@@ -240,6 +326,8 @@ def stage3_f(
         gathered_tokens.untyped_storage().resize_(0)
 
     ctx.comp_stream.record_event(ctx.fwd_event)
+    if is_deepep_backend(ctx.ep_backend):
+        ctx.fwd_comm_prev_event = deep_ep.EventHandle()
 
     nvtx.range_pop()
     return record, moe_outs
@@ -284,9 +372,10 @@ def stage3_w(ctx: ExecutionCtx, layer: DecoderLayerProtocol):
 # ------------------------------------------------------------
 
 
-@dataclass(init=False, slots=True)
+@dataclass(slots=True)
 class Stage4Record:
-    ctx: Optional[tuple]
+    a2a_ctx: Optional[tuple] = None
+    dispatch_state: Optional[dict] = None
 
 
 def stage4_f(
@@ -296,10 +385,23 @@ def stage4_f(
     input_splits: Optional[List[int]],
     output_splits: Optional[List[int]],
     ep_group: Optional[torch.distributed.ProcessGroup] = None,
+    dispatch_state: Optional[dict] = None,
 ):
-    """Stage4 forward: all-to-all combine for expert parallelism."""
+    """Stage4 forward: pure communication — all-to-all combine."""
     nvtx.range_push("layer%02d.stage4_f" % layer.idx)
     record = Stage4Record()
+
+    if is_deepep_dispatch_state(dispatch_state):
+        combined, ctx.fwd_comm_work = deepep_combine(
+            ctx.ep_backend,
+            moe_outs,
+            dispatch_state,
+            comp_stream=ctx.comp_stream,
+            previous_event=ctx.fwd_comm_prev_event,
+        )
+        record.dispatch_state = dispatch_state
+        nvtx.range_pop()
+        return record, combined
 
     moe_outs = moe_outs.detach()
     ctx.comm_stream.wait_event(ctx.fwd_event)
@@ -307,9 +409,7 @@ def stage4_f(
     if output_splits is not None:
         with torch.cuda.stream(ctx.comm_stream):
             moe_outs = direct_all_to_all(moe_outs, input_splits, output_splits, ep_group)
-        record.ctx = (input_splits, output_splits, ep_group)
-    else:
-        record.ctx = None
+        record.a2a_ctx = (input_splits, output_splits, ep_group)
 
     ctx.fwd_comm_work = getattr(moe_outs, "comm_work", None)
     setattr(moe_outs, "comm_work", None)
@@ -324,13 +424,37 @@ def stage4_b(
     record: Stage4Record,
     grad_tensors: tuple,
 ):
-    """Stage4 backward: reverse all-to-all."""
+    """Stage4 backward: pure communication — reverse all-to-all. On the deepep
+    path this calls buf.dispatch (reverse of buf.combine)."""
     nvtx.range_push("layer%02d.stage4_b" % layer.idx)
+
+    if is_deepep_dispatch_state(record.dispatch_state):
+        ep = ctx.ep_backend
+        buf = ep["buffer"]
+        dispatch_state = record.dispatch_state
+        grad_combined = grad_tensors[0]
+        # Snapshot comp_stream so comm_stream waits only on grad_combined-ready.
+        prev_event = deep_ep.EventHandle()
+        grad_combined.record_stream(ep["comm_stream"])
+
+        with torch.cuda.stream(ep["comm_stream"]):
+            moe_outs_grad, _, _, _, ev = buf.dispatch(
+                grad_combined.contiguous(),
+                handle=dispatch_state["dispatch_handle"],
+                num_sms=ep["num_sms"],
+                previous_event=prev_event,
+                async_with_compute_stream=True,
+                allocate_on_comm_stream=True,
+            )
+        moe_outs_grad.record_stream(ctx.comp_stream)
+        ctx.bwd_comm_work = DeepEPEventWork(ev)  # stage3_b waits before using
+        nvtx.range_pop()
+        return moe_outs_grad
 
     ctx.comm_stream.wait_event(ctx.bwd_event)
 
-    if record.ctx is not None:
-        output_splits, input_splits, group = record.ctx
+    if record.a2a_ctx is not None:
+        output_splits, input_splits, group = record.a2a_ctx
         with torch.cuda.stream(ctx.comm_stream):
             moe_outs_grad = direct_all_to_all(grad_tensors[0], input_splits, output_splits, group)
         ctx.bwd_comm_work = moe_outs_grad.comm_work
@@ -446,9 +570,17 @@ def stage5_and_stage1_f(
 
     output = next_layer.forward_attn(hidden_states)
     ctx.comp_stream.record_event(ctx.fwd_event)
+    if is_deepep_backend(ctx.ep_backend):
+        ctx.fwd_comm_prev_event = deep_ep.EventHandle()
 
     if hasattr(next_layer.mlp, "experts"):
-        stage1_outs = Stage1OutsMoe(output.sorted_tokens, output.topk_weight, output.residual)
+        stage1_outs = Stage1OutsMoe(
+            output.hidden_states_post_attn
+            if uses_deepep_dispatch(next_layer)
+            else output.sorted_tokens,
+            output.topk_weight,
+            output.residual,
+        )
     else:
         stage1_outs = Stage1OutsMlp(output.sorted_tokens, output.residual)
 
@@ -587,10 +719,8 @@ def create_intermediate_tensors_layer() -> IntermediateTensorsLayer:
     layer = IntermediateTensorsLayer()
     layer.stage1 = Stage1Record()
     layer.stage2 = Stage2Record()
-    layer.stage2.ctx = None
     layer.stage3 = Stage3Record()
     layer.stage4 = Stage4Record()
-    layer.stage4.ctx = None
     layer.stage5 = Stage5Record()
     return layer
 

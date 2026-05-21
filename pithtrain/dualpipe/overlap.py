@@ -39,7 +39,7 @@ from pithtrain.models.interface import ModelProtocol
 
 
 def _clear_layer_records(layer: IntermediateTensorsLayer) -> None:
-    """Clear tensor references from a layer's records while keeping records pre-allocated."""
+    """Clear tensor refs while keeping the pre-allocated record slots."""
     for field in fields(layer):
         record = getattr(layer, field.name)
         for rf in fields(record):
@@ -77,6 +77,7 @@ def overlapped_forward_backward(
     intermediate_tensors1: IntermediateTensors,
     comm_stream: Optional[torch.cuda.Stream],
     ep_group: Optional[torch.distributed.ProcessGroup] = None,
+    ep_backend=None,
 ):
     assert abs(len(module0.layers) - len(module1.layers)) <= 1
     assert len(intermediate_tensors1.layers) == len(module1.layers)
@@ -96,6 +97,8 @@ def overlapped_forward_backward(
     ctx.fwd_comm_work = None
     ctx.bwd_comm_work = None
     ctx.fwd_comm_deferred_free = []
+    ctx.ep_backend = ep_backend
+    ctx.fwd_comm_prev_event = None
 
     # Module 1 layer L-1 stage 5 backward
     if loss1 is not None:
@@ -138,6 +141,8 @@ def overlapped_forward_backward(
         expand_idx,
         dedup_input_splits,
         dedup_output_splits,
+        hidden_states_post_attn,
+        topk_ids,
     ) = output
 
     for l in range(num_layers):  # noqa: E741
@@ -152,7 +157,6 @@ def overlapped_forward_backward(
                 and stage1_record.outs is not None
                 and not (hasattr(stage1_record, "args") and stage1_record.args is not None)
             )
-
             if use_merged:
                 next_layer, prev_layer = module1_layers[-l], module1_layers[-l - 1]
                 stage1_outs = stage1_record.outs
@@ -198,12 +202,15 @@ def overlapped_forward_backward(
                 input_splits,
                 output_splits,
                 ep_group,
+                dispatch_state=intermediate_tensors0.layers[layer_idx0].stage2.dispatch_state,
             )
-            intermediate_tensors0.layers[layer_idx0].stage4.ctx = record.ctx
+            intermediate_tensors0.layers[layer_idx0].stage4 = record
+            # stage4_f's comm reads moe_outs on the comm stream; defer the free
+            # until stage5_f drains the queue after fwd_comm_work.wait().
             if hasattr(module0_layers[l - 1].mlp, "experts") and ctx.fwd_comm_work is not None:
                 ctx.fwd_comm_deferred_free.append(
                     intermediate_tensors0.layers[layer_idx0].stage3.outs.moe_outs
-                )  # freed after Stage 5 waits
+                )
 
             # Module 1 layer L-l-1 stage 4 backward
             record = intermediate_tensors1.layers[-l - 1].stage4
@@ -245,6 +252,8 @@ def overlapped_forward_backward(
                     expand_idx,
                     dedup_input_splits,
                     dedup_output_splits,
+                    hidden_states_post_attn,
+                    topk_ids,
                 ) = output
             else:
                 # Module 0 layer l-1 stage 5 forward
@@ -274,6 +283,8 @@ def overlapped_forward_backward(
                     expand_idx,
                     dedup_input_splits,
                     dedup_output_splits,
+                    hidden_states_post_attn,
+                    topk_ids,
                 ) = output
 
         # Module 1 layer L-l-1 stage 3 backward
@@ -281,21 +292,36 @@ def overlapped_forward_backward(
         gathered_tokens_grad = stage3_b(ctx, module1_layers[-l - 1], record, (moe_outs_grad,))
 
         # Module 0 layer l stage 2 forward
-        record, gathered_tokens = stage2_f(
+        record, gathered_tokens, expert_idxs, expand_idx = stage2_f(
             ctx,
             module0_layers[l],
             sorted_tokens,
             dedup_output_splits,
             dedup_input_splits,
             ep_group,
+            expert_idxs=expert_idxs,
+            expand_idx=expand_idx,
+            hidden_states_post_attn=hidden_states_post_attn,
+            topk_ids=topk_ids,
+            topk_weight=topk_weight,
         )
-        intermediate_tensors0.layers[layer_idx0].stage2.ctx = record.ctx
-        if hasattr(module0_layers[l].mlp, "experts") and ctx.fwd_comm_work is not None:
+        intermediate_tensors0.layers[layer_idx0].stage2 = record
+        # Skip on deepep: sorted_tokens is None (forward_attn skipped prepare).
+        if (
+            hasattr(module0_layers[l].mlp, "experts")
+            and ctx.fwd_comm_work is not None
+            and sorted_tokens is not None
+        ):
             ctx.fwd_comm_deferred_free.append(sorted_tokens)  # freed after Stage 3 waits
 
         # Module 1 layer L-l-1 stage 2 backward
         record = intermediate_tensors1.layers[-l - 1].stage2
-        sorted_tokens_grad = stage2_b(ctx, module1_layers[-l - 1], record, (gathered_tokens_grad,))
+        sorted_tokens_grad, tw_grad_from_dispatch = stage2_b(
+            ctx, module1_layers[-l - 1], record, (gathered_tokens_grad,)
+        )
+        if tw_grad_from_dispatch is not None:
+            # deepep path: stage2_b's buf.combine produced the topk_weight grad.
+            topk_weight_grad = tw_grad_from_dispatch
 
         # Module 1 layer L-l-1 stage 3 weight backward
         stage3_w(ctx, module1_layers[-l - 1])
@@ -307,19 +333,26 @@ def overlapped_forward_backward(
             gathered_tokens,
             expert_idxs,
             expand_idx,
+            dispatch_state=intermediate_tensors0.layers[layer_idx0].stage2.dispatch_state,
         )
         intermediate_tensors0.layers[layer_idx0].stage3.args = record.args
         intermediate_tensors0.layers[layer_idx0].stage3.outs = record.outs
 
     # Module 0 layer L-1 stage 4 forward
     record, moe_outs = stage4_f(
-        ctx, module0_layers[num_layers - 1], moe_outs, input_splits, output_splits, ep_group
+        ctx,
+        module0_layers[num_layers - 1],
+        moe_outs,
+        input_splits,
+        output_splits,
+        ep_group,
+        dispatch_state=intermediate_tensors0.layers[layer_idx0].stage2.dispatch_state,
     )
-    intermediate_tensors0.layers[layer_idx0].stage4.ctx = record.ctx
+    intermediate_tensors0.layers[layer_idx0].stage4 = record
     if hasattr(module0_layers[num_layers - 1].mlp, "experts") and ctx.fwd_comm_work is not None:
         ctx.fwd_comm_deferred_free.append(
             intermediate_tensors0.layers[layer_idx0].stage3.outs.moe_outs
-        )  # freed after Stage 5 waits
+        )
 
     # Module 1 layer 0 stage 1 backward
     record = intermediate_tensors1.layers[-num_layers].stage1

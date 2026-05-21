@@ -3,9 +3,23 @@ from typing import Dict, List, NamedTuple, Optional, Protocol
 import torch
 import torch.nn as nn
 
+from pithtrain.operators.ep_backend import is_deepep_backend
+
+
+def uses_deepep_dispatch(layer) -> bool:
+    """True iff this layer's a2a goes through deepep (vs direct_all_to_all)."""
+    return is_deepep_backend(getattr(layer.mlp, "ep_backend", None)) and layer.mlp.ep_size > 1
+
+
+def needs_ep_prepare_dispatch(layer) -> bool:
+    """True iff the torch all-to-all path is in use (deepep handles dedup
+    inside buf.dispatch and skips moe_ep_prepare_dispatch)."""
+    return not uses_deepep_dispatch(layer)
+
 
 class ForwardAttnOutput(NamedTuple):
-    """Output from the forward_attn method of a decoder layer."""
+    """Output from forward_attn. The deepep backend uses hidden_states_post_attn
+    + topk_ids; the torch backend uses sorted_tokens + splits."""
 
     sorted_tokens: torch.Tensor
     moe_local_idxs: torch.Tensor
@@ -17,6 +31,8 @@ class ForwardAttnOutput(NamedTuple):
     expand_idx: Optional[torch.Tensor] = None
     dedup_input_splits: Optional[List[int]] = None
     dedup_output_splits: Optional[List[int]] = None
+    hidden_states_post_attn: Optional[torch.Tensor] = None
+    topk_ids: Optional[torch.Tensor] = None
 
 
 class DecoderLayerMlpProtocol(Protocol):
@@ -53,6 +69,7 @@ class DecoderLayerProtocol(Protocol):
         gathered_tokens: torch.Tensor,
         expert_idxs: Optional[torch.Tensor] = None,
         expand_idx: Optional[torch.Tensor] = None,
+        dispatch_state: Optional[dict] = None,
     ) -> torch.Tensor:
         """MLP forward."""
 

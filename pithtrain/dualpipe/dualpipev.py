@@ -59,6 +59,7 @@ class DualPipeV(nn.Module):
         modules: Tuple[nn.Module, nn.Module],
         pp_group: dist.ProcessGroup,
         ep_group: dist.ProcessGroup,
+        ep_backend=None,
     ) -> None:
         super().__init__()
 
@@ -70,6 +71,15 @@ class DualPipeV(nn.Module):
 
         self.pp_group = pp_group
         self.ep_group = ep_group
+        self.ep_backend = ep_backend
+        # Stash on each MoE layer's mlp — the single source of truth read by
+        # uses_deepep_dispatch / needs_ep_prepare_dispatch and by
+        # decoder_layer_forward / decoder_layer_backward.
+        for m in modules:
+            if hasattr(m, "layers"):
+                for layer in m.layers.values():
+                    if hasattr(layer.mlp, "experts"):
+                        layer.mlp.ep_backend = ep_backend
         self.pp_size = self.pp_group.size()
         self.ep_size = self.ep_group.size()
         self.ep_rank = self.ep_group.rank()
@@ -269,6 +279,7 @@ class DualPipeV(nn.Module):
             self.intermediate_tensors_chunks[phase1][chunk_id1],
             self.comm_stream,
             self.ep_group,
+            self.ep_backend,
         )
         nvtx.range_pop()
 

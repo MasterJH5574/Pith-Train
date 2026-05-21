@@ -10,7 +10,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 uv venv && uv sync
+bash scripts/install_deepep.sh   # run once per checkout (and after every `uv sync`)
 ```
+
+DeepEP v2 is built outside `uv sync` because its build needs a `libnccl.so` SONAME symlink and a multi-arch (`9.0 10.0`) override that uv can't express. The script is idempotent. Override the clone location with `DEEPEP_DIR=/path/to/DeepEP bash scripts/install_deepep.sh`. The shipped `pyproject.toml` already overrides `nvidia-nccl-cu13 >= 2.30.4` (DeepEP needs it; torch otherwise pins it to 2.29.7).
 
 ## Common Commands
 
