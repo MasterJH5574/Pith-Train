@@ -14,8 +14,9 @@ from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, Prolog
 from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
 from pithtrain.dualpipe.utils import run_backward
-from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
+from pithtrain.layers.factory import ModelImplMode
 from pithtrain.models.interface import ForwardAttnOutput
+from pithtrain.models.spec import build_module, get_layer_spec
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import mla_flash_attn_func
@@ -185,15 +186,21 @@ class DeepseekV2LiteMLP(nn.Module):
         config: DeepseekV3Config,
         hidden_size: Optional[int] = None,
         intermediate_size: Optional[int] = None,
+        submodules=None,
     ):
         super().__init__()
         self.hidden_size = hidden_size or config.hidden_size
         self.intermediate_size = intermediate_size or config.intermediate_size
 
-        LinearCls = get_linear_cls()
-        self.gate_proj = LinearCls(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = LinearCls(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = LinearCls(self.intermediate_size, self.hidden_size, bias=False)
+        self.gate_proj = build_module(
+            submodules["gate_proj"], self.hidden_size, self.intermediate_size, bias=False
+        )
+        self.up_proj = build_module(
+            submodules["up_proj"], self.hidden_size, self.intermediate_size, bias=False
+        )
+        self.down_proj = build_module(
+            submodules["down_proj"], self.intermediate_size, self.hidden_size, bias=False
+        )
 
     def forward(self, x):
         g = self.gate_proj(x)
@@ -208,16 +215,22 @@ class DeepseekV2LiteExperts(nn.Module):
         num_experts: int,
         hidden_size: Optional[int] = None,
         intermediate_size: Optional[int] = None,
+        submodules=None,
     ):
         super().__init__()
         self.config = config
         self.hidden_size = hidden_size or config.hidden_size
         self.intermediate_size = intermediate_size or config.intermediate_size
 
-        GroupLinearCls = get_group_linear_cls()
-        self.gate_proj = GroupLinearCls(num_experts, self.hidden_size, self.intermediate_size)
-        self.up_proj = GroupLinearCls(num_experts, self.hidden_size, self.intermediate_size)
-        self.down_proj = GroupLinearCls(num_experts, self.intermediate_size, self.hidden_size)
+        self.gate_proj = build_module(
+            submodules["gate_proj"], num_experts, self.hidden_size, self.intermediate_size
+        )
+        self.up_proj = build_module(
+            submodules["up_proj"], num_experts, self.hidden_size, self.intermediate_size
+        )
+        self.down_proj = build_module(
+            submodules["down_proj"], num_experts, self.intermediate_size, self.hidden_size
+        )
 
     def forward(
         self,
@@ -287,6 +300,7 @@ class DeepseekV2LiteMoEWithGroupGeMM(nn.Module):
         config: DeepseekV3Config,
         ep_group: Optional[dist.ProcessGroup] = None,
         layer_id: int = 0,
+        submodules=None,
     ):
         super().__init__()
         self.config = config
@@ -297,16 +311,17 @@ class DeepseekV2LiteMoEWithGroupGeMM(nn.Module):
         self.experts_per_rank = config.n_routed_experts // self.ep_size
         self.n_routed_experts = config.n_routed_experts
 
-        self.experts = DeepseekV2LiteExperts(
+        self.experts = build_module(
+            submodules["experts"],
             config,
             self.experts_per_rank,
             intermediate_size=config.moe_intermediate_size,
         )
-        self.gate = DeepseekV2LiteMoEGate(config)
+        self.gate = build_module(submodules["gate"], config)
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV2LiteMLP(
-                config=config, intermediate_size=intermediate_size
+            self.shared_experts = build_module(
+                submodules["shared_experts"], config, intermediate_size=intermediate_size
             )
 
     def forward(self, hidden_states):
@@ -345,6 +360,7 @@ class DeepseekV2LiteAttention(nn.Module):
         config: DeepseekV3Config,
         layer_id: int = 0,
         cp_group: Optional[dist.ProcessGroup] = None,
+        submodules=None,
     ):
         super().__init__()
         self.config = config
@@ -359,21 +375,28 @@ class DeepseekV2LiteAttention(nn.Module):
         self.cp_group = cp_group
         self.use_ring_attn = cp_group is not None and cp_group.size() > 1
 
-        LinearCls = get_linear_cls()
-        self.q_proj = LinearCls(self.hidden_size, self.num_heads * self.q_head_dim, bias=False)
-        self.kv_a_proj_with_mqa = LinearCls(
+        self.q_proj = build_module(
+            submodules["q_proj"], self.hidden_size, self.num_heads * self.q_head_dim, bias=False
+        )
+        self.kv_a_proj_with_mqa = build_module(
+            submodules["kv_a_proj_with_mqa"],
             self.hidden_size,
             config.kv_lora_rank + config.qk_rope_head_dim,
             bias=False,
         )
-        self.kv_a_layernorm = nn.RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
-        self.kv_b_proj = LinearCls(
+        self.kv_a_layernorm = build_module(
+            submodules["kv_a_layernorm"], config.kv_lora_rank, eps=config.rms_norm_eps
+        )
+        self.kv_b_proj = build_module(
+            submodules["kv_b_proj"],
             config.kv_lora_rank,
             self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
             bias=False,
         )
 
-        self.o_proj = LinearCls(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
+        self.o_proj = build_module(
+            submodules["o_proj"], self.num_heads * self.v_head_dim, self.hidden_size, bias=False
+        )
         self.softmax_scale = self.q_head_dim ** (-0.5)
 
     def forward(
@@ -441,24 +464,18 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         layer_id: int,
         ep_group: Optional[dist.ProcessGroup] = None,
         cp_group: Optional[dist.ProcessGroup] = None,
+        submodules=None,
     ):
         super().__init__()
         self.idx = layer_id
-        self.self_attn = DeepseekV2LiteAttention(
-            config=config, layer_id=layer_id, cp_group=cp_group
+        self.self_attn = build_module(submodules["self_attn"], config, layer_id, cp_group=cp_group)
+        self.mlp = build_module(submodules["mlp"], config)
+        self.input_layernorm = build_module(
+            submodules["input_layernorm"], config.hidden_size, eps=config.rms_norm_eps
         )
-
-        self.mlp = (
-            DeepseekV2LiteMoEWithGroupGeMM(config, ep_group, layer_id)
-            if (
-                config.n_routed_experts is not None
-                and layer_id >= config.first_k_dense_replace
-                and layer_id % config.moe_layer_freq == 0
-            )
-            else DeepseekV2LiteMLP(config)
+        self.post_attention_layernorm = build_module(
+            submodules["post_attention_layernorm"], config.hidden_size, eps=config.rms_norm_eps
         )
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         if self.self_attn.use_ring_attn:
             self._forward_attn_compute = self._forward_attn_compute.__wrapped__.__get__(
@@ -669,7 +686,13 @@ class DeepseekV2LiteModel(nn.Module):
         layer_id_end = layer_id_begin + num_local_layers[stage_id]
         self.layers = nn.ModuleDict(
             {
-                str(i): DeepseekV2LiteDecoderLayer(config, i, ep_group, cp_group=cp_group)
+                str(i): build_module(
+                    get_layer_spec(config.model_type, config, i, ep_group, cp_group),
+                    config,
+                    i,
+                    ep_group,
+                    cp_group=cp_group,
+                )
                 for i in range(layer_id_begin, layer_id_end)
             }
         )

@@ -15,9 +15,10 @@ from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
 from pithtrain.dualpipe.utils import FP8WeightCacheControl, run_backward
 from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinearFunc
-from pithtrain.layers.factory import ModelImplMode, get_linear_cls
+from pithtrain.layers.factory import ModelImplMode
 from pithtrain.layers.group_linear import GroupLinearFunc
 from pithtrain.models.interface import ForwardAttnOutput
+from pithtrain.models.spec import build_module, get_layer_spec
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
 from pithtrain.operators.deepgemm_fp8_quantize import fused_blockwise_transpose_cast_to_fp8_batched
@@ -321,6 +322,7 @@ class GptOssMLP(nn.Module):
         swiglu_limit: float,
         ep_size: int = 1,
         ep_group: Optional[dist.ProcessGroup] = None,
+        submodules=None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -332,10 +334,16 @@ class GptOssMLP(nn.Module):
         self.ep_rank = ep_group.rank() if ep_group is not None else 0
         self.experts_per_rank = num_experts // ep_size
 
-        self.experts = GptOssExperts(
-            self.experts_per_rank, hidden_size, intermediate_size, swiglu_limit
+        self.experts = build_module(
+            submodules["experts"],
+            self.experts_per_rank,
+            hidden_size,
+            intermediate_size,
+            swiglu_limit,
         )
-        self.router = GptOssTopKRouter(hidden_size, num_experts, num_experts_per_tok)
+        self.router = build_module(
+            submodules["router"], hidden_size, num_experts, num_experts_per_tok
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
@@ -394,6 +402,7 @@ class GptOssAttention(nn.Module):
         attention_bias: bool = True,
         is_sliding: bool = False,
         sliding_window: int = 128,
+        submodules=None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -404,11 +413,18 @@ class GptOssAttention(nn.Module):
         self.is_sliding = is_sliding
         self.sliding_window = sliding_window
 
-        LinearCls = get_linear_cls()
-        self.q_proj = LinearCls(hidden_size, num_attention_heads * head_dim, bias=attention_bias)
-        self.k_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
-        self.v_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
-        self.o_proj = LinearCls(num_attention_heads * head_dim, hidden_size, bias=attention_bias)
+        self.q_proj = build_module(
+            submodules["q_proj"], hidden_size, num_attention_heads * head_dim, bias=attention_bias
+        )
+        self.k_proj = build_module(
+            submodules["k_proj"], hidden_size, num_key_value_heads * head_dim, bias=attention_bias
+        )
+        self.v_proj = build_module(
+            submodules["v_proj"], hidden_size, num_key_value_heads * head_dim, bias=attention_bias
+        )
+        self.o_proj = build_module(
+            submodules["o_proj"], num_attention_heads * head_dim, hidden_size, bias=attention_bias
+        )
 
         self.sinks = nn.Parameter(torch.zeros(num_attention_heads))
 
@@ -477,12 +493,14 @@ class GptOssDecoderLayer(nn.Module):
         sliding_window: int = 128,
         ep_size: int = 1,
         ep_group: Optional[dist.ProcessGroup] = None,
+        submodules=None,
     ):
         super().__init__()
         self.idx = layer_idx
         self.hidden_size = hidden_size
 
-        self.self_attn = GptOssAttention(
+        self.self_attn = build_module(
+            submodules["self_attn"],
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_key_value_heads=num_key_value_heads,
@@ -492,18 +510,21 @@ class GptOssDecoderLayer(nn.Module):
             sliding_window=sliding_window,
         )
 
-        self.mlp = GptOssMLP(
+        self.mlp = build_module(
+            submodules["mlp"],
             hidden_size=hidden_size,
             num_experts=num_experts,
             num_experts_per_tok=num_experts_per_tok,
             intermediate_size=intermediate_size,
             swiglu_limit=swiglu_limit,
-            ep_size=ep_size,
-            ep_group=ep_group,
         )
 
-        self.input_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.input_layernorm = build_module(
+            submodules["input_layernorm"], hidden_size, eps=rms_norm_eps
+        )
+        self.post_attention_layernorm = build_module(
+            submodules["post_attention_layernorm"], hidden_size, eps=rms_norm_eps
+        )
 
     def _forward_attn_compute(self, hidden_states: torch.Tensor):
         residual = hidden_states
@@ -684,7 +705,8 @@ class GptOssModel(nn.Module):
 
         self.layers = nn.ModuleDict(
             {
-                str(i): GptOssDecoderLayer(
+                str(i): build_module(
+                    get_layer_spec(config.model_type, config, i, ep_group, cp_group),
                     hidden_size=hidden_size,
                     num_attention_heads=num_attention_heads,
                     num_key_value_heads=num_key_value_heads,

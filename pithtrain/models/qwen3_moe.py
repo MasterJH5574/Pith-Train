@@ -12,8 +12,9 @@ from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, Prolog
 from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
 from pithtrain.dualpipe.utils import run_backward
-from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
+from pithtrain.layers.factory import ModelImplMode
 from pithtrain.models.interface import ForwardAttnOutput
+from pithtrain.models.spec import build_module, get_layer_spec
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
@@ -131,17 +132,24 @@ class Qwen3MoeMLP(nn.Module):
 
     def __init__(
         self,
-        hidden_size: int,
-        intermediate_size: int,
+        config,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        submodules=None,
     ):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
+        self.hidden_size = hidden_size or config.hidden_size
+        self.intermediate_size = intermediate_size or config.intermediate_size
 
-        LinearCls = get_linear_cls()
-        self.gate_proj = LinearCls(hidden_size, intermediate_size, bias=False)
-        self.up_proj = LinearCls(hidden_size, intermediate_size, bias=False)
-        self.down_proj = LinearCls(intermediate_size, hidden_size, bias=False)
+        self.gate_proj = build_module(
+            submodules["gate_proj"], self.hidden_size, self.intermediate_size, bias=False
+        )
+        self.up_proj = build_module(
+            submodules["up_proj"], self.hidden_size, self.intermediate_size, bias=False
+        )
+        self.down_proj = build_module(
+            submodules["down_proj"], self.intermediate_size, self.hidden_size, bias=False
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(silu_mul(self.gate_proj(x), self.up_proj(x)))
@@ -152,19 +160,26 @@ class Qwen3MoeExperts(nn.Module):
 
     def __init__(
         self,
+        config,
         num_experts: int,
-        hidden_size: int,
-        moe_intermediate_size: int,
+        hidden_size: Optional[int] = None,
+        moe_intermediate_size: Optional[int] = None,
+        submodules=None,
     ):
         super().__init__()
         self.num_experts = num_experts
-        self.hidden_size = hidden_size
-        self.moe_intermediate_size = moe_intermediate_size
+        self.hidden_size = hidden_size or config.hidden_size
+        self.moe_intermediate_size = moe_intermediate_size or config.moe_intermediate_size
 
-        GroupLinearCls = get_group_linear_cls()
-        self.gate_proj = GroupLinearCls(num_experts, hidden_size, moe_intermediate_size)
-        self.up_proj = GroupLinearCls(num_experts, hidden_size, moe_intermediate_size)
-        self.down_proj = GroupLinearCls(num_experts, moe_intermediate_size, hidden_size)
+        self.gate_proj = build_module(
+            submodules["gate_proj"], num_experts, self.hidden_size, self.moe_intermediate_size
+        )
+        self.up_proj = build_module(
+            submodules["up_proj"], num_experts, self.hidden_size, self.moe_intermediate_size
+        )
+        self.down_proj = build_module(
+            submodules["down_proj"], num_experts, self.moe_intermediate_size, self.hidden_size
+        )
 
     def forward(
         self,
@@ -183,19 +198,15 @@ class Qwen3MoeExperts(nn.Module):
 class Qwen3MoeGate(nn.Module):
     """Top-K routing gate for MoE with softmax normalization."""
 
-    def __init__(
-        self,
-        hidden_size: int,
-        num_experts: int,
-        num_experts_per_tok: int,
-        norm_topk_prob: bool = True,
-    ):
+    def __init__(self, config):
         super().__init__()
-        self.num_experts = num_experts
-        self.num_experts_per_tok = num_experts_per_tok
-        self.norm_topk_prob = norm_topk_prob
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
         self.load_balance_loss_fn = None
-        self.weight = nn.Parameter(torch.empty((num_experts, hidden_size)), requires_grad=True)
+        self.weight = nn.Parameter(
+            torch.empty((self.num_experts, config.hidden_size)), requires_grad=True
+        )
 
     @torch.compile(fullgraph=True)
     def compute(
@@ -265,31 +276,30 @@ class Qwen3MoeMoE(nn.Module):
 
     def __init__(
         self,
-        hidden_size: int,
-        num_experts: int,
-        num_experts_per_tok: int,
-        moe_intermediate_size: int,
-        norm_topk_prob: bool = True,
-        ep_size: int = 1,
+        config,
         ep_group: Optional[dist.ProcessGroup] = None,
+        layer_id: int = 0,
+        submodules=None,
     ):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_experts = num_experts
-        self.num_experts_per_tok = num_experts_per_tok
-        self.moe_intermediate_size = moe_intermediate_size
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.moe_intermediate_size = config.moe_intermediate_size
 
-        self.ep_size = ep_size
+        self.ep_size = getattr(config, "ep_size", 1)
         self.ep_group = ep_group
         self.ep_rank = ep_group.rank() if ep_group is not None else 0
-        self.experts_per_rank = num_experts // ep_size
+        self.experts_per_rank = self.num_experts // self.ep_size
 
-        self.experts = Qwen3MoeExperts(
+        self.experts = build_module(
+            submodules["experts"],
+            config,
             self.experts_per_rank,
-            hidden_size,
-            moe_intermediate_size,
+            moe_intermediate_size=config.moe_intermediate_size,
         )
-        self.gate = Qwen3MoeGate(hidden_size, num_experts, num_experts_per_tok, norm_topk_prob)
+        self.gate = build_module(submodules["gate"], config)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
@@ -329,32 +339,49 @@ class Qwen3MoeAttention(nn.Module):
 
     def __init__(
         self,
-        hidden_size: int,
-        num_attention_heads: int,
-        num_key_value_heads: int,
-        head_dim: int,
-        rms_norm_eps: float = 1e-6,
-        attention_bias: bool = False,
+        config,
         cp_group: Optional[dist.ProcessGroup] = None,
+        submodules=None,
     ):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_attention_heads
-        self.num_kv_heads = num_key_value_heads
-        self.head_dim = head_dim
-        self.num_key_value_groups = num_attention_heads // num_key_value_heads
-        self.scaling = head_dim**-0.5
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        self.scaling = self.head_dim**-0.5
         self.cp_group = cp_group
         self.use_ring_attn = cp_group is not None and cp_group.size() > 1
 
-        LinearCls = get_linear_cls()
-        self.q_proj = LinearCls(hidden_size, num_attention_heads * head_dim, bias=attention_bias)
-        self.k_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
-        self.v_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
-        self.o_proj = LinearCls(num_attention_heads * head_dim, hidden_size, bias=attention_bias)
-
-        self.q_norm = nn.RMSNorm(head_dim, eps=rms_norm_eps)
-        self.k_norm = nn.RMSNorm(head_dim, eps=rms_norm_eps)
+        attention_bias = getattr(config, "attention_bias", False)
+        self.q_proj = build_module(
+            submodules["q_proj"],
+            self.hidden_size,
+            self.num_heads * self.head_dim,
+            bias=attention_bias,
+        )
+        self.k_proj = build_module(
+            submodules["k_proj"],
+            self.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=attention_bias,
+        )
+        self.v_proj = build_module(
+            submodules["v_proj"],
+            self.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=attention_bias,
+        )
+        self.o_proj = build_module(
+            submodules["o_proj"],
+            self.num_heads * self.head_dim,
+            self.hidden_size,
+            bias=attention_bias,
+        )
+        self.q_norm = build_module(submodules["q_norm"], self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = build_module(submodules["k_norm"], self.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -427,60 +454,24 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        hidden_size: int,
-        num_attention_heads: int,
-        num_key_value_heads: int,
-        head_dim: int,
-        intermediate_size: int,
-        num_experts: int,
-        num_experts_per_tok: int,
-        moe_intermediate_size: int,
-        rms_norm_eps: float,
-        attention_bias: bool,
-        norm_topk_prob: bool,
-        layer_idx: int,
-        decoder_sparse_step: int = 1,
-        mlp_only_layers: Optional[List[int]] = None,
-        ep_size: int = 1,
+        config,
+        layer_id: int,
         ep_group: Optional[dist.ProcessGroup] = None,
         cp_group: Optional[dist.ProcessGroup] = None,
+        submodules=None,
     ):
         super().__init__()
-        self.idx = layer_idx
-        self.hidden_size = hidden_size
+        self.idx = layer_id
+        self.hidden_size = config.hidden_size
 
-        self.self_attn = Qwen3MoeAttention(
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            attention_bias=attention_bias,
-            cp_group=cp_group,
+        self.self_attn = build_module(submodules["self_attn"], config, cp_group=cp_group)
+        self.mlp = build_module(submodules["mlp"], config)
+        self.input_layernorm = build_module(
+            submodules["input_layernorm"], config.hidden_size, eps=config.rms_norm_eps
         )
-
-        mlp_only_layers = mlp_only_layers or []
-        use_moe = (
-            num_experts > 0
-            and (layer_idx + 1) % decoder_sparse_step == 0
-            and layer_idx not in mlp_only_layers
+        self.post_attention_layernorm = build_module(
+            submodules["post_attention_layernorm"], config.hidden_size, eps=config.rms_norm_eps
         )
-
-        if use_moe:
-            self.mlp = Qwen3MoeMoE(
-                hidden_size=hidden_size,
-                num_experts=num_experts,
-                num_experts_per_tok=num_experts_per_tok,
-                moe_intermediate_size=moe_intermediate_size,
-                norm_topk_prob=norm_topk_prob,
-                ep_size=ep_size,
-                ep_group=ep_group,
-            )
-        else:
-            self.mlp = Qwen3MoeMLP(hidden_size, intermediate_size)
-
-        self.input_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
 
         if self.self_attn.use_ring_attn:
             self._forward_attn_compute = self._forward_attn_compute.__wrapped__.__get__(
@@ -670,26 +661,12 @@ class Qwen3MoeModel(nn.Module):
         self.cp_rank = cp_group.rank() if cp_group is not None else 0
         self.cp_size = cp_group.size() if cp_group is not None else 1
 
-        hidden_size = config.hidden_size
-        num_attention_heads = config.num_attention_heads
-        num_key_value_heads = config.num_key_value_heads
-        head_dim = getattr(config, "head_dim", hidden_size // num_attention_heads)
-        intermediate_size = config.intermediate_size
-        num_experts = config.num_experts
-        num_experts_per_tok = config.num_experts_per_tok
-        moe_intermediate_size = config.moe_intermediate_size
-        rms_norm_eps = config.rms_norm_eps
-        attention_bias = getattr(config, "attention_bias", False)
-        norm_topk_prob = getattr(config, "norm_topk_prob", True)
-        decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
-        mlp_only_layers = getattr(config, "mlp_only_layers", [])
-        vocab_size = config.vocab_size
-        max_position_embeddings = config.max_position_embeddings
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         rope_theta = getattr(config, "rope_theta", 1000000.0)
 
-        ep_size = getattr(config, "ep_size", 1)
-
-        self.embed_tokens = nn.Embedding(vocab_size, hidden_size) if stage_id == 0 else None
+        self.embed_tokens = (
+            nn.Embedding(config.vocab_size, config.hidden_size) if stage_id == 0 else None
+        )
 
         num_local_layers = layer_partition(config.num_hidden_layers, num_stages)
         layer_id_begin = sum(num_local_layers[:stage_id])
@@ -697,39 +674,27 @@ class Qwen3MoeModel(nn.Module):
 
         self.layers = nn.ModuleDict(
             {
-                str(i): Qwen3MoeDecoderLayer(
-                    hidden_size=hidden_size,
-                    num_attention_heads=num_attention_heads,
-                    num_key_value_heads=num_key_value_heads,
-                    head_dim=head_dim,
-                    intermediate_size=intermediate_size,
-                    num_experts=num_experts,
-                    num_experts_per_tok=num_experts_per_tok,
-                    moe_intermediate_size=moe_intermediate_size,
-                    rms_norm_eps=rms_norm_eps,
-                    attention_bias=attention_bias,
-                    norm_topk_prob=norm_topk_prob,
-                    layer_idx=i,
-                    decoder_sparse_step=decoder_sparse_step,
-                    mlp_only_layers=mlp_only_layers,
-                    ep_size=ep_size,
+                str(i): build_module(
+                    get_layer_spec(config.model_type, config, i, ep_group, cp_group),
+                    config,
+                    i,
+                    ep_group,
                     cp_group=cp_group,
-                    ep_group=ep_group,
                 )
                 for i in range(layer_id_begin, layer_id_end)
             }
         )
 
         if stage_id == num_stages - 1:
-            self.norm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
-            self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+            self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         else:
             self.norm = None
             self.lm_head = None
 
         self.rotary_emb = Qwen3MoeRotaryEmbedding(
             head_dim,
-            max_position_embeddings=max_position_embeddings,
+            max_position_embeddings=config.max_position_embeddings,
             base=rope_theta,
         )
 
