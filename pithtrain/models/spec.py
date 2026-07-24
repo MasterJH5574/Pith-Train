@@ -18,8 +18,26 @@ class ModuleSpec:
     submodules: Dict[str, "ModuleSpec"] = field(default_factory=dict)
 
 
-# key -> "module.path:attr"; populated only for the string-keyed variant.
-MODULE_REGISTRY: Dict[str, str] = {}
+# key -> "module.path:attr"
+MODULE_REGISTRY: Dict[str, str] = {
+    "deepseek.attn": "pithtrain.models.deepseek_v2_lite:DeepseekV2LiteAttention",
+    "deepseek.mlp": "pithtrain.models.deepseek_v2_lite:DeepseekV2LiteMLP",
+    "deepseek.moe": "pithtrain.models.deepseek_v2_lite:DeepseekV2LiteMoEWithGroupGeMM",
+    "deepseek.experts": "pithtrain.models.deepseek_v2_lite:DeepseekV2LiteExperts",
+    "deepseek.gate": "pithtrain.models.deepseek_v2_lite:DeepseekV2LiteMoEGate",
+    "deepseek.layer": "pithtrain.models.deepseek_v2_lite:DeepseekV2LiteDecoderLayer",
+    "qwen3.attn": "pithtrain.models.qwen3_moe:Qwen3MoeAttention",
+    "qwen3.mlp": "pithtrain.models.qwen3_moe:Qwen3MoeMLP",
+    "qwen3.moe": "pithtrain.models.qwen3_moe:Qwen3MoeMoE",
+    "qwen3.experts": "pithtrain.models.qwen3_moe:Qwen3MoeExperts",
+    "qwen3.gate": "pithtrain.models.qwen3_moe:Qwen3MoeGate",
+    "qwen3.layer": "pithtrain.models.qwen3_moe:Qwen3MoeDecoderLayer",
+    "gpt_oss.attn": "pithtrain.models.gpt_oss:GptOssAttention",
+    "gpt_oss.mlp": "pithtrain.models.gpt_oss:GptOssMLP",
+    "gpt_oss.experts": "pithtrain.models.gpt_oss:GptOssExperts",
+    "gpt_oss.router": "pithtrain.models.gpt_oss:GptOssTopKRouter",
+    "gpt_oss.layer": "pithtrain.models.gpt_oss:GptOssDecoderLayer",
+}
 
 # model_type -> "module.path:layer_spec_fn"
 SPEC_BUILDERS: Dict[str, str] = {
@@ -79,17 +97,8 @@ def grouped_experts_submodules() -> Dict[str, ModuleSpec]:
 
 
 def deepseek_layer_spec(config, layer_id, ep_group=None, cp_group=None) -> ModuleSpec:
-    from pithtrain.models.deepseek_v2_lite import (
-        DeepseekV2LiteAttention,
-        DeepseekV2LiteDecoderLayer,
-        DeepseekV2LiteExperts,
-        DeepseekV2LiteMLP,
-        DeepseekV2LiteMoEGate,
-        DeepseekV2LiteMoEWithGroupGeMM,
-    )
-
     attn = ModuleSpec(
-        DeepseekV2LiteAttention,
+        "deepseek.attn",
         submodules={
             "q_proj": linear_spec(),
             "kv_a_proj_with_mqa": linear_spec(),
@@ -105,22 +114,22 @@ def deepseek_layer_spec(config, layer_id, ep_group=None, cp_group=None) -> Modul
     )
     if use_moe:
         moe_sub = {
-            "gate": ModuleSpec(DeepseekV2LiteMoEGate),
-            "experts": ModuleSpec(DeepseekV2LiteExperts, submodules=grouped_experts_submodules()),
+            "gate": ModuleSpec("deepseek.gate"),
+            "experts": ModuleSpec("deepseek.experts", submodules=grouped_experts_submodules()),
         }
         if config.n_shared_experts is not None:
             moe_sub["shared_experts"] = ModuleSpec(
-                DeepseekV2LiteMLP, submodules=dense_mlp_submodules()
+                "deepseek.mlp", submodules=dense_mlp_submodules()
             )
         mlp = ModuleSpec(
-            DeepseekV2LiteMoEWithGroupGeMM,
+            "deepseek.moe",
             kwargs={"ep_group": ep_group, "layer_id": layer_id},
             submodules=moe_sub,
         )
     else:
-        mlp = ModuleSpec(DeepseekV2LiteMLP, submodules=dense_mlp_submodules())
+        mlp = ModuleSpec("deepseek.mlp", submodules=dense_mlp_submodules())
     return ModuleSpec(
-        DeepseekV2LiteDecoderLayer,
+        "deepseek.layer",
         submodules={
             "self_attn": attn,
             "mlp": mlp,
@@ -131,17 +140,8 @@ def deepseek_layer_spec(config, layer_id, ep_group=None, cp_group=None) -> Modul
 
 
 def qwen3_layer_spec(config, layer_id, ep_group=None, cp_group=None) -> ModuleSpec:
-    from pithtrain.models.qwen3_moe import (
-        Qwen3MoeAttention,
-        Qwen3MoeDecoderLayer,
-        Qwen3MoeExperts,
-        Qwen3MoeGate,
-        Qwen3MoeMLP,
-        Qwen3MoeMoE,
-    )
-
     attn = ModuleSpec(
-        Qwen3MoeAttention,
+        "qwen3.attn",
         submodules={
             "q_proj": linear_spec(),
             "k_proj": linear_spec(),
@@ -160,17 +160,17 @@ def qwen3_layer_spec(config, layer_id, ep_group=None, cp_group=None) -> ModuleSp
     )
     if use_moe:
         mlp = ModuleSpec(
-            Qwen3MoeMoE,
+            "qwen3.moe",
             kwargs={"ep_group": ep_group, "layer_id": layer_id},
             submodules={
-                "experts": ModuleSpec(Qwen3MoeExperts, submodules=grouped_experts_submodules()),
-                "gate": ModuleSpec(Qwen3MoeGate),
+                "experts": ModuleSpec("qwen3.experts", submodules=grouped_experts_submodules()),
+                "gate": ModuleSpec("qwen3.gate"),
             },
         )
     else:
-        mlp = ModuleSpec(Qwen3MoeMLP, submodules=dense_mlp_submodules())
+        mlp = ModuleSpec("qwen3.mlp", submodules=dense_mlp_submodules())
     return ModuleSpec(
-        Qwen3MoeDecoderLayer,
+        "qwen3.layer",
         submodules={
             "self_attn": attn,
             "mlp": mlp,
@@ -181,16 +181,8 @@ def qwen3_layer_spec(config, layer_id, ep_group=None, cp_group=None) -> ModuleSp
 
 
 def gpt_oss_layer_spec(config, layer_id, ep_group=None, cp_group=None) -> ModuleSpec:
-    from pithtrain.models.gpt_oss import (
-        GptOssAttention,
-        GptOssDecoderLayer,
-        GptOssExperts,
-        GptOssMLP,
-        GptOssTopKRouter,
-    )
-
     attn = ModuleSpec(
-        GptOssAttention,
+        "gpt_oss.attn",
         submodules={
             "q_proj": linear_spec(),
             "k_proj": linear_spec(),
@@ -199,12 +191,15 @@ def gpt_oss_layer_spec(config, layer_id, ep_group=None, cp_group=None) -> Module
         },
     )
     mlp = ModuleSpec(
-        GptOssMLP,
+        "gpt_oss.mlp",
         kwargs={"ep_size": getattr(config, "ep_size", 1), "ep_group": ep_group},
-        submodules={"experts": ModuleSpec(GptOssExperts), "router": ModuleSpec(GptOssTopKRouter)},
+        submodules={
+            "experts": ModuleSpec("gpt_oss.experts"),
+            "router": ModuleSpec("gpt_oss.router"),
+        },
     )
     return ModuleSpec(
-        GptOssDecoderLayer,
+        "gpt_oss.layer",
         submodules={
             "self_attn": attn,
             "mlp": mlp,
