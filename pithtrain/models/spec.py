@@ -21,13 +21,6 @@ class ModuleSpec:
 # key -> "module.path:attr"; populated only for the string-keyed variant.
 MODULE_REGISTRY: Dict[str, str] = {}
 
-# model_type -> "module.path:layer_spec_fn"
-SPEC_BUILDERS: Dict[str, str] = {
-    "deepseek_v2": "pithtrain.models.spec:deepseek_layer_spec",
-    "qwen3_moe": "pithtrain.models.spec:qwen3_layer_spec",
-    "gpt_oss": "pithtrain.models.spec:gpt_oss_layer_spec",
-}
-
 
 def _resolve(path: str) -> Callable:
     module_path, attr = path.split(":")
@@ -49,11 +42,7 @@ def build_module(spec: Optional[ModuleSpec], *args, **kwargs) -> Optional[nn.Mod
     return cls(*args, *spec.args, **merged)
 
 
-def get_layer_spec(model_type: str, *args, **kwargs) -> ModuleSpec:
-    return _resolve(SPEC_BUILDERS[model_type])(*args, **kwargs)
-
-
-# Shared building blocks (reused across model layer specs).
+# Shared building blocks (reused across architectures).
 def linear_spec() -> ModuleSpec:
     return ModuleSpec(get_linear_cls())
 
@@ -78,133 +67,123 @@ def grouped_experts_submodules() -> Dict[str, ModuleSpec]:
     }
 
 
-def deepseek_layer_spec(config, layer_id, ep_group=None, cp_group=None) -> ModuleSpec:
-    from pithtrain.models.deepseek_v2_lite import (
-        DeepseekV2LiteAttention,
-        DeepseekV2LiteDecoderLayer,
-        DeepseekV2LiteExperts,
-        DeepseekV2LiteMLP,
-        DeepseekV2LiteMoEGate,
-        DeepseekV2LiteMoEWithGroupGeMM,
-    )
-
-    attn = ModuleSpec(
-        DeepseekV2LiteAttention,
-        submodules={
-            "q_proj": linear_spec(),
-            "kv_a_proj_with_mqa": linear_spec(),
-            "kv_a_layernorm": norm_spec(),
-            "kv_b_proj": linear_spec(),
-            "o_proj": linear_spec(),
-        },
-    )
-    use_moe = (
-        config.n_routed_experts is not None
-        and layer_id >= config.first_k_dense_replace
-        and layer_id % config.moe_layer_freq == 0
-    )
-    if use_moe:
-        moe_sub = {
-            "gate": ModuleSpec(DeepseekV2LiteMoEGate),
-            "experts": ModuleSpec(DeepseekV2LiteExperts, submodules=grouped_experts_submodules()),
-        }
-        if config.n_shared_experts is not None:
-            moe_sub["shared_experts"] = ModuleSpec(
-                DeepseekV2LiteMLP, submodules=dense_mlp_submodules()
-            )
-        mlp = ModuleSpec(
+def get_layer_spec(model_type, config, layer_id, ep_group=None, cp_group=None) -> ModuleSpec:
+    if model_type == "deepseek_v2":
+        from pithtrain.models.deepseek_v2_lite import (
+            DeepseekV2LiteAttention,
+            DeepseekV2LiteDecoderLayer,
+            DeepseekV2LiteExperts,
+            DeepseekV2LiteMLP,
+            DeepseekV2LiteMoEGate,
             DeepseekV2LiteMoEWithGroupGeMM,
-            kwargs={"ep_group": ep_group, "layer_id": layer_id},
-            submodules=moe_sub,
         )
-    else:
-        mlp = ModuleSpec(DeepseekV2LiteMLP, submodules=dense_mlp_submodules())
-    return ModuleSpec(
-        DeepseekV2LiteDecoderLayer,
-        submodules={
-            "self_attn": attn,
-            "mlp": mlp,
-            "input_layernorm": norm_spec(),
-            "post_attention_layernorm": norm_spec(),
-        },
-    )
 
-
-def qwen3_layer_spec(config, layer_id, ep_group=None, cp_group=None) -> ModuleSpec:
-    from pithtrain.models.qwen3_moe import (
-        Qwen3MoeAttention,
-        Qwen3MoeDecoderLayer,
-        Qwen3MoeExperts,
-        Qwen3MoeGate,
-        Qwen3MoeMLP,
-        Qwen3MoeMoE,
-    )
-
-    attn = ModuleSpec(
-        Qwen3MoeAttention,
-        submodules={
-            "q_proj": linear_spec(),
-            "k_proj": linear_spec(),
-            "v_proj": linear_spec(),
-            "o_proj": linear_spec(),
-            "q_norm": norm_spec(),
-            "k_norm": norm_spec(),
-        },
-    )
-    decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
-    mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
-    use_moe = (
-        config.num_experts > 0
-        and (layer_id + 1) % decoder_sparse_step == 0
-        and layer_id not in mlp_only_layers
-    )
-    if use_moe:
-        mlp = ModuleSpec(
-            Qwen3MoeMoE,
-            kwargs={"ep_group": ep_group, "layer_id": layer_id},
+        attn = ModuleSpec(
+            DeepseekV2LiteAttention,
             submodules={
-                "experts": ModuleSpec(Qwen3MoeExperts, submodules=grouped_experts_submodules()),
-                "gate": ModuleSpec(Qwen3MoeGate),
+                "q_proj": linear_spec(),
+                "kv_a_proj_with_mqa": linear_spec(),
+                "kv_a_layernorm": norm_spec(),
+                "kv_b_proj": linear_spec(),
+                "o_proj": linear_spec(),
             },
         )
+        use_moe = (
+            config.n_routed_experts is not None
+            and layer_id >= config.first_k_dense_replace
+            and layer_id % config.moe_layer_freq == 0
+        )
+        if use_moe:
+            moe_sub = {
+                "gate": ModuleSpec(DeepseekV2LiteMoEGate),
+                "experts": ModuleSpec(
+                    DeepseekV2LiteExperts, submodules=grouped_experts_submodules()
+                ),
+            }
+            if config.n_shared_experts is not None:
+                moe_sub["shared_experts"] = ModuleSpec(
+                    DeepseekV2LiteMLP, submodules=dense_mlp_submodules()
+                )
+            mlp = ModuleSpec(
+                DeepseekV2LiteMoEWithGroupGeMM,
+                kwargs={"ep_group": ep_group, "layer_id": layer_id},
+                submodules=moe_sub,
+            )
+        else:
+            mlp = ModuleSpec(DeepseekV2LiteMLP, submodules=dense_mlp_submodules())
+        layer_cls = DeepseekV2LiteDecoderLayer
+    elif model_type == "qwen3_moe":
+        from pithtrain.models.qwen3_moe import (
+            Qwen3MoeAttention,
+            Qwen3MoeDecoderLayer,
+            Qwen3MoeExperts,
+            Qwen3MoeGate,
+            Qwen3MoeMLP,
+            Qwen3MoeMoE,
+        )
+
+        attn = ModuleSpec(
+            Qwen3MoeAttention,
+            submodules={
+                "q_proj": linear_spec(),
+                "k_proj": linear_spec(),
+                "v_proj": linear_spec(),
+                "o_proj": linear_spec(),
+                "q_norm": norm_spec(),
+                "k_norm": norm_spec(),
+            },
+        )
+        decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
+        mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
+        use_moe = (
+            config.num_experts > 0
+            and (layer_id + 1) % decoder_sparse_step == 0
+            and layer_id not in mlp_only_layers
+        )
+        if use_moe:
+            mlp = ModuleSpec(
+                Qwen3MoeMoE,
+                kwargs={"ep_group": ep_group, "layer_id": layer_id},
+                submodules={
+                    "experts": ModuleSpec(Qwen3MoeExperts, submodules=grouped_experts_submodules()),
+                    "gate": ModuleSpec(Qwen3MoeGate),
+                },
+            )
+        else:
+            mlp = ModuleSpec(Qwen3MoeMLP, submodules=dense_mlp_submodules())
+        layer_cls = Qwen3MoeDecoderLayer
+    elif model_type == "gpt_oss":
+        from pithtrain.models.gpt_oss import (
+            GptOssAttention,
+            GptOssDecoderLayer,
+            GptOssExperts,
+            GptOssMLP,
+            GptOssTopKRouter,
+        )
+
+        attn = ModuleSpec(
+            GptOssAttention,
+            submodules={
+                "q_proj": linear_spec(),
+                "k_proj": linear_spec(),
+                "v_proj": linear_spec(),
+                "o_proj": linear_spec(),
+            },
+        )
+        mlp = ModuleSpec(
+            GptOssMLP,
+            kwargs={"ep_size": getattr(config, "ep_size", 1), "ep_group": ep_group},
+            submodules={
+                "experts": ModuleSpec(GptOssExperts),
+                "router": ModuleSpec(GptOssTopKRouter),
+            },
+        )
+        layer_cls = GptOssDecoderLayer
     else:
-        mlp = ModuleSpec(Qwen3MoeMLP, submodules=dense_mlp_submodules())
+        raise ValueError(f"Unsupported model_type: {model_type}")
+
     return ModuleSpec(
-        Qwen3MoeDecoderLayer,
-        submodules={
-            "self_attn": attn,
-            "mlp": mlp,
-            "input_layernorm": norm_spec(),
-            "post_attention_layernorm": norm_spec(),
-        },
-    )
-
-
-def gpt_oss_layer_spec(config, layer_id, ep_group=None, cp_group=None) -> ModuleSpec:
-    from pithtrain.models.gpt_oss import (
-        GptOssAttention,
-        GptOssDecoderLayer,
-        GptOssExperts,
-        GptOssMLP,
-        GptOssTopKRouter,
-    )
-
-    attn = ModuleSpec(
-        GptOssAttention,
-        submodules={
-            "q_proj": linear_spec(),
-            "k_proj": linear_spec(),
-            "v_proj": linear_spec(),
-            "o_proj": linear_spec(),
-        },
-    )
-    mlp = ModuleSpec(
-        GptOssMLP,
-        kwargs={"ep_size": getattr(config, "ep_size", 1), "ep_group": ep_group},
-        submodules={"experts": ModuleSpec(GptOssExperts), "router": ModuleSpec(GptOssTopKRouter)},
-    )
-    return ModuleSpec(
-        GptOssDecoderLayer,
+        layer_cls,
         submodules={
             "self_attn": attn,
             "mlp": mlp,
