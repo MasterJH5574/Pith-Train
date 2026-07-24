@@ -39,13 +39,6 @@ MODULE_REGISTRY: Dict[str, str] = {
     "gpt_oss.layer": "pithtrain.models.gpt_oss:GptOssDecoderLayer",
 }
 
-# model_type -> "module.path:layer_spec_fn"
-SPEC_BUILDERS: Dict[str, str] = {
-    "deepseek_v2": "pithtrain.models.spec:deepseek_layer_spec",
-    "qwen3_moe": "pithtrain.models.spec:qwen3_layer_spec",
-    "gpt_oss": "pithtrain.models.spec:gpt_oss_layer_spec",
-}
-
 
 def _resolve(path: str) -> Callable:
     module_path, attr = path.split(":")
@@ -67,11 +60,7 @@ def build_module(spec: Optional[ModuleSpec], *args, **kwargs) -> Optional[nn.Mod
     return cls(*args, *spec.args, **merged)
 
 
-def get_layer_spec(model_type: str, *args, **kwargs) -> ModuleSpec:
-    return _resolve(SPEC_BUILDERS[model_type])(*args, **kwargs)
-
-
-# Shared building blocks (reused across model layer specs).
+# Shared building blocks (reused across architectures).
 def linear_spec() -> ModuleSpec:
     return ModuleSpec(get_linear_cls())
 
@@ -96,110 +85,95 @@ def grouped_experts_submodules() -> Dict[str, ModuleSpec]:
     }
 
 
-def deepseek_layer_spec(config, layer_id, ep_group=None, cp_group=None) -> ModuleSpec:
-    attn = ModuleSpec(
-        "deepseek.attn",
-        submodules={
-            "q_proj": linear_spec(),
-            "kv_a_proj_with_mqa": linear_spec(),
-            "kv_a_layernorm": norm_spec(),
-            "kv_b_proj": linear_spec(),
-            "o_proj": linear_spec(),
-        },
-    )
-    use_moe = (
-        config.n_routed_experts is not None
-        and layer_id >= config.first_k_dense_replace
-        and layer_id % config.moe_layer_freq == 0
-    )
-    if use_moe:
-        moe_sub = {
-            "gate": ModuleSpec("deepseek.gate"),
-            "experts": ModuleSpec("deepseek.experts", submodules=grouped_experts_submodules()),
-        }
-        if config.n_shared_experts is not None:
-            moe_sub["shared_experts"] = ModuleSpec(
-                "deepseek.mlp", submodules=dense_mlp_submodules()
-            )
-        mlp = ModuleSpec(
-            "deepseek.moe",
-            kwargs={"ep_group": ep_group, "layer_id": layer_id},
-            submodules=moe_sub,
-        )
-    else:
-        mlp = ModuleSpec("deepseek.mlp", submodules=dense_mlp_submodules())
-    return ModuleSpec(
-        "deepseek.layer",
-        submodules={
-            "self_attn": attn,
-            "mlp": mlp,
-            "input_layernorm": norm_spec(),
-            "post_attention_layernorm": norm_spec(),
-        },
-    )
-
-
-def qwen3_layer_spec(config, layer_id, ep_group=None, cp_group=None) -> ModuleSpec:
-    attn = ModuleSpec(
-        "qwen3.attn",
-        submodules={
-            "q_proj": linear_spec(),
-            "k_proj": linear_spec(),
-            "v_proj": linear_spec(),
-            "o_proj": linear_spec(),
-            "q_norm": norm_spec(),
-            "k_norm": norm_spec(),
-        },
-    )
-    decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
-    mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
-    use_moe = (
-        config.num_experts > 0
-        and (layer_id + 1) % decoder_sparse_step == 0
-        and layer_id not in mlp_only_layers
-    )
-    if use_moe:
-        mlp = ModuleSpec(
-            "qwen3.moe",
-            kwargs={"ep_group": ep_group, "layer_id": layer_id},
+def get_layer_spec(model_type, config, layer_id, ep_group=None, cp_group=None) -> ModuleSpec:
+    if model_type == "deepseek_v2":
+        attn = ModuleSpec(
+            "deepseek.attn",
             submodules={
-                "experts": ModuleSpec("qwen3.experts", submodules=grouped_experts_submodules()),
-                "gate": ModuleSpec("qwen3.gate"),
+                "q_proj": linear_spec(),
+                "kv_a_proj_with_mqa": linear_spec(),
+                "kv_a_layernorm": norm_spec(),
+                "kv_b_proj": linear_spec(),
+                "o_proj": linear_spec(),
             },
         )
+        use_moe = (
+            config.n_routed_experts is not None
+            and layer_id >= config.first_k_dense_replace
+            and layer_id % config.moe_layer_freq == 0
+        )
+        if use_moe:
+            moe_sub = {
+                "gate": ModuleSpec("deepseek.gate"),
+                "experts": ModuleSpec("deepseek.experts", submodules=grouped_experts_submodules()),
+            }
+            if config.n_shared_experts is not None:
+                moe_sub["shared_experts"] = ModuleSpec(
+                    "deepseek.mlp", submodules=dense_mlp_submodules()
+                )
+            mlp = ModuleSpec(
+                "deepseek.moe",
+                kwargs={"ep_group": ep_group, "layer_id": layer_id},
+                submodules=moe_sub,
+            )
+        else:
+            mlp = ModuleSpec("deepseek.mlp", submodules=dense_mlp_submodules())
+        layer_key = "deepseek.layer"
+    elif model_type == "qwen3_moe":
+        attn = ModuleSpec(
+            "qwen3.attn",
+            submodules={
+                "q_proj": linear_spec(),
+                "k_proj": linear_spec(),
+                "v_proj": linear_spec(),
+                "o_proj": linear_spec(),
+                "q_norm": norm_spec(),
+                "k_norm": norm_spec(),
+            },
+        )
+        decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
+        mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
+        use_moe = (
+            config.num_experts > 0
+            and (layer_id + 1) % decoder_sparse_step == 0
+            and layer_id not in mlp_only_layers
+        )
+        if use_moe:
+            mlp = ModuleSpec(
+                "qwen3.moe",
+                kwargs={"ep_group": ep_group, "layer_id": layer_id},
+                submodules={
+                    "experts": ModuleSpec("qwen3.experts", submodules=grouped_experts_submodules()),
+                    "gate": ModuleSpec("qwen3.gate"),
+                },
+            )
+        else:
+            mlp = ModuleSpec("qwen3.mlp", submodules=dense_mlp_submodules())
+        layer_key = "qwen3.layer"
+    elif model_type == "gpt_oss":
+        attn = ModuleSpec(
+            "gpt_oss.attn",
+            submodules={
+                "q_proj": linear_spec(),
+                "k_proj": linear_spec(),
+                "v_proj": linear_spec(),
+                "o_proj": linear_spec(),
+            },
+        )
+        mlp = ModuleSpec(
+            "gpt_oss.mlp",
+            kwargs={"ep_size": getattr(config, "ep_size", 1), "ep_group": ep_group},
+            submodules={
+                "experts": ModuleSpec("gpt_oss.experts"),
+                "router": ModuleSpec("gpt_oss.router"),
+            },
+        )
+        layer_key = "gpt_oss.layer"
     else:
-        mlp = ModuleSpec("qwen3.mlp", submodules=dense_mlp_submodules())
-    return ModuleSpec(
-        "qwen3.layer",
-        submodules={
-            "self_attn": attn,
-            "mlp": mlp,
-            "input_layernorm": norm_spec(),
-            "post_attention_layernorm": norm_spec(),
-        },
-    )
+        raise ValueError(f"Unsupported model_type: {model_type}")
 
-
-def gpt_oss_layer_spec(config, layer_id, ep_group=None, cp_group=None) -> ModuleSpec:
-    attn = ModuleSpec(
-        "gpt_oss.attn",
-        submodules={
-            "q_proj": linear_spec(),
-            "k_proj": linear_spec(),
-            "v_proj": linear_spec(),
-            "o_proj": linear_spec(),
-        },
-    )
-    mlp = ModuleSpec(
-        "gpt_oss.mlp",
-        kwargs={"ep_size": getattr(config, "ep_size", 1), "ep_group": ep_group},
-        submodules={
-            "experts": ModuleSpec("gpt_oss.experts"),
-            "router": ModuleSpec("gpt_oss.router"),
-        },
-    )
     return ModuleSpec(
-        "gpt_oss.layer",
+        layer_key,
         submodules={
             "self_attn": attn,
             "mlp": mlp,
