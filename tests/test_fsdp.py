@@ -6,7 +6,6 @@ The loss and gradients are compared with a reference implementation.
 import argparse
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Union
 
 import torch
 import torch.distributed.fsdp
@@ -18,9 +17,8 @@ from transformers import AutoConfig
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
 from pithtrain.layers.factory import ModelImplMode
 from pithtrain.layers.group_linear import GroupLinear
-from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel, DeepseekV2LiteMoEGate
-from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
-from pithtrain.models.qwen3_30b_a3b import Qwen3MoeGate, Qwen3MoeModel
+from pithtrain.models.moe import FusedExperts, ScaledTopKGate, TopKGate, TopKRouter
+from pithtrain.models.transformer import TransformerModel
 from pithtrain.modules import shutdown
 from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
 
@@ -32,11 +30,11 @@ def fill_weights(module: nn.Module):
             nn.init.zeros_(module.bias)
     elif isinstance(module, GroupLinear):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
-    elif isinstance(module, GptOssExperts):
+    elif isinstance(module, FusedExperts):
         # Raw nn.Parameter - the GroupLinear branch above doesn't reach them.
         nn.init.xavier_uniform_(module.gate_up_proj, gain=1.0)
         nn.init.xavier_uniform_(module.down_proj, gain=1.0)
-    elif isinstance(module, (DeepseekV2LiteMoEGate, Qwen3MoeGate, GptOssTopKRouter)):
+    elif isinstance(module, (ScaledTopKGate, TopKGate, TopKRouter)):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if getattr(module, "bias", None) is not None:
             nn.init.zeros_(module.bias)
@@ -59,7 +57,7 @@ def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 def reference_step(
     x: torch.Tensor,
     l: torch.Tensor,  # noqa: E741
-    model: Union[DeepseekV2LiteModel, Qwen3MoeModel],
+    model: TransformerModel,
     chunks: int,
 ):
     ys, ls = [], []
@@ -132,7 +130,7 @@ def apply_fsdp(model, mesh: torch.distributed.DeviceMesh, dtype):
     )
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
-        assert isinstance(model[i], (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel))
+        assert isinstance(model[i], TransformerModel)
         if model[i].embed_tokens is not None:
             fully_shard(
                 model[i].embed_tokens,
@@ -196,13 +194,10 @@ def main(ctx: DistributedCtx, model_name: str):
     config = AutoConfig.from_pretrained(config_path)
 
     if config.model_type == "deepseek_v2":
-        ModelClass = DeepseekV2LiteModel
         config.num_hidden_layers = min(config.num_hidden_layers, 8)
     elif config.model_type == "qwen3_moe":
-        ModelClass = Qwen3MoeModel
         config.num_hidden_layers = min(config.num_hidden_layers, 8)
     elif config.model_type == "gpt_oss":
-        ModelClass = GptOssModel
         # Keep alternating sliding/full pattern when slicing layers.
         keep = min(config.num_hidden_layers, 8)
         if getattr(config, "layer_types", None) is not None:
@@ -210,6 +205,7 @@ def main(ctx: DistributedCtx, model_name: str):
         config.num_hidden_layers = keep
     else:
         raise ValueError(f"Unsupported model: {model_name}")
+    ModelClass = TransformerModel
 
     torch.distributed.barrier()
     torch.manual_seed(1234)

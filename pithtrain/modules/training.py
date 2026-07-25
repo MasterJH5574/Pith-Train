@@ -19,9 +19,7 @@ from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
-from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel
-from pithtrain.models.gpt_oss import GptOssModel
-from pithtrain.models.qwen3_30b_a3b import Qwen3MoeModel
+from pithtrain.models.transformer import TransformerModel
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.load_balance import make_load_balance_loss_fn
 
@@ -210,7 +208,7 @@ def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02) -> N
     Parameters
     ----------
     model : nn.Module
-        A single pipeline-stage module (e.g. ``DeepseekV2LiteModel``).
+        A single pipeline-stage module (a ``TransformerModel``).
     num_layers : int
         Total number of transformer layers in the *full* model (not just this
         stage).  Used to compute the output-layer scaling factor.
@@ -242,7 +240,7 @@ def apply_fsdp(model, mesh: torch.distributed.DeviceMesh):
     )
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
-        assert isinstance(model[i], (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel))
+        assert isinstance(model[i], TransformerModel)
         if model[i].embed_tokens is not None:
             fully_shard(
                 model[i].embed_tokens,
@@ -322,17 +320,10 @@ def setup_model(cfg: TrainingCfg, ctx: TrainingCtx, distributed: DistributedCtx)
 
     hidden_size = module_config.hidden_size
 
-    if module_config.model_type == "deepseek_v2":
-        ModelClass = DeepseekV2LiteModel
-        model_kwargs = {"cp_group": cp_group}
-    elif module_config.model_type == "qwen3_moe":
-        ModelClass = Qwen3MoeModel
-        model_kwargs = {"cp_group": cp_group}
-    elif module_config.model_type == "gpt_oss":
-        ModelClass = GptOssModel
-        model_kwargs = {"cp_group": cp_group}
-    else:
+    if module_config.model_type not in ("deepseek_v2", "qwen3_moe", "gpt_oss"):
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
+    ModelClass = TransformerModel
+    model_kwargs = {"cp_group": cp_group}
 
     modules.append(
         ModelClass(module_config, pp_size * 2, pp_rank, ep_group=ep_group, **model_kwargs)

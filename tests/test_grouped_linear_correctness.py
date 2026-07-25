@@ -646,7 +646,7 @@ def test_group_linear_weight_grad_store():
 
 def test_gpt_oss_experts_weight_grad_store_matches_direct():
     """
-    End-to-end sanity check: GptOssExperts (now backed by GroupLinearFunc for
+    End-to-end sanity check: FusedExperts (now backed by GroupLinearFunc for
     the expert GEMMs) produces the same input / weight / bias gradients whether
     WeightGradStore is enabled or disabled.
 
@@ -655,7 +655,7 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
     autograd on both paths.
     """
     from pithtrain.dualpipe.utils import WeightGradStore
-    from pithtrain.models.gpt_oss import GptOssExperts
+    from pithtrain.models.moe import FusedExperts
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -674,7 +674,7 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
     torch.manual_seed(123)
     x_raw = torch.randn(M_total, hidden_size, device=device, dtype=dtype)
 
-    experts_ref = GptOssExperts(num_experts, hidden_size, intermediate_size, swiglu_limit)
+    experts_ref = FusedExperts(num_experts, hidden_size, intermediate_size, swiglu_limit)
     experts_ref = experts_ref.to(device=device, dtype=dtype)
     with torch.no_grad():
         experts_ref.gate_up_proj.normal_(std=0.02)
@@ -682,7 +682,7 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
         experts_ref.gate_up_proj_bias.normal_(std=0.02)
         experts_ref.down_proj_bias.normal_(std=0.02)
 
-    experts_def = GptOssExperts(num_experts, hidden_size, intermediate_size, swiglu_limit)
+    experts_def = FusedExperts(num_experts, hidden_size, intermediate_size, swiglu_limit)
     experts_def = experts_def.to(device=device, dtype=dtype)
     experts_def.load_state_dict(experts_ref.state_dict())
 
