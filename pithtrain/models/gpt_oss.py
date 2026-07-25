@@ -16,7 +16,7 @@ from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_fo
 from pithtrain.dualpipe.utils import FP8WeightCacheControl, run_backward
 from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinearFunc
 from pithtrain.layers.factory import ModelImplMode, get_linear_cls
-from pithtrain.layers.group_linear import GroupLinearFunc
+from pithtrain.layers.te_group_linear import TEGroupLinearFunc
 from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
@@ -226,7 +226,9 @@ class GptOssExperts(nn.Module):
             return FP8GroupLinearFunc.apply(
                 x, weight, offs, ks, ks_tensor, self._quantized_weight(name, weight), group_indices
             )
-        return GroupLinearFunc.apply(x, weight, offs)
+        # BF16 experts run on TE grouped GEMM; convert cumulative offs -> m_splits.
+        m_splits = ks if ks is not None else torch.diff(offs, prepend=offs.new_zeros(1)).tolist()
+        return TEGroupLinearFunc.apply(x, weight, m_splits)
 
     def forward(
         self,

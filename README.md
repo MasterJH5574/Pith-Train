@@ -12,7 +12,9 @@ PithTrain is built to be understood — by humans and AI agents alike. At ~10K l
 
 ## Installation
 
-NVIDIA Hopper (SM90) or Blackwell (SM100) GPUs are required. CUDA 13.0 and Python >= 3.12 are required. We use [uv](https://docs.astral.sh/uv/) to manage project dependencies.
+NVIDIA Hopper (SM90) or Blackwell (SM100) GPUs are required. CUDA 13.0, cuDNN 9.3+ (including the development headers), and Python >= 3.12 are required. We use [uv](https://docs.astral.sh/uv/) to manage project dependencies.
+
+PithTrain builds NVIDIA [TransformerEngine](https://github.com/NVIDIA/TransformerEngine) from source (pinned to commit `5671fd36`, release 2.12) as part of installation. For the TransformerEngine build itself and its prerequisites, follow the official guide for that release: <https://docs.nvidia.com/deeplearning/transformer-engine-releases/release-2.12/user-guide/installation.html>.
 
 ```bash
 git clone https://github.com/mlc-ai/Pith-Train.git && cd Pith-Train
@@ -30,6 +32,8 @@ uv pip install .
 ```bash
 uv sync
 ```
+
+The TransformerEngine source build must be able to find the cuDNN development headers (`cudnn.h`) at compile time; see the TransformerEngine installation guide linked above for the requirements.
 
 ## Getting Started
 

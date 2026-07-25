@@ -25,7 +25,7 @@ from triton.testing import do_bench
 
 from benchmarks.operators.utilities import Metrics
 from pithtrain.layers.deepgemm_fp8_linear import ARCH_MAJOR, FP8GroupLinear, FP8Linear
-from pithtrain.layers.group_linear import GroupLinear
+from pithtrain.layers.te_group_linear import TEGroupLinear
 from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 
 try:
@@ -218,7 +218,7 @@ def bench_grouped_fwd(num_groups: int, m_per_group: int, N: int, K: int) -> Metr
         num_groups, m_per_group, K
     )
 
-    ref = GroupLinear(num_groups, K, N).cuda().bfloat16()
+    ref = TEGroupLinear(num_groups, K, N).cuda().bfloat16()
     nn.init.normal_(ref.weight)
     fp8 = FP8GroupLinear(num_groups, K, N).cuda().bfloat16()
     fp8.weight.data.copy_(ref.weight.data)
@@ -267,7 +267,7 @@ def bench_grouped_bwd(num_groups: int, m_per_group: int, N: int, K: int) -> Metr
     input_tokens = input_tokens.detach().requires_grad_(True)
     grad = torch.randn((actual_M, N), dtype=torch.bfloat16, device="cuda")
 
-    ref = GroupLinear(num_groups, K, N).cuda().bfloat16()
+    ref = TEGroupLinear(num_groups, K, N).cuda().bfloat16()
     nn.init.normal_(ref.weight)
     fp8 = FP8GroupLinear(num_groups, K, N).cuda().bfloat16()
     fp8.weight.data.copy_(ref.weight.data)

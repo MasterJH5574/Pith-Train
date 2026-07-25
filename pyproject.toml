@@ -8,6 +8,13 @@ dependencies = [
     "flash-attn-4[cu13]>=4.0.0b7",
     "tilelang",
     "torch>=2.10.0",
+    # Non-Python-native ablation arm: MoE experts + attention/RMSNorm/RoPE/SwiGLU
+    # route through TransformerEngine. Pinned to 2.12.0 (commit 5671fd36) — the
+    # version the paper's Megatron eval used, which still carries the CUTLASS
+    # grouped-GEMM path (removed in 2.17). This is a source build; the setup must
+    # export NVTE_FRAMEWORK=pytorch, NVTE_WITH_NCCL_EP=0, NVTE_CUDA_ARCHS="90;100"
+    # (also wired into [tool.uv.extra-build-variables] below).
+    "transformer-engine @ git+https://github.com/NVIDIA/TransformerEngine.git@5671fd36",
     "transformers",
     "wandb",
     "zstandard",
@@ -41,8 +48,21 @@ deep-gemm = [
     "setuptools",
     "wheel",
 ]
+# TransformerEngine 2.12 builds its CUDA/C++ extensions from source.
+transformer-engine = [
+    "torch>=2.10.0",
+    "packaging",
+    "setuptools",
+    "wheel",
+    "pybind11",
+    "cmake",
+    "ninja",
+]
 [tool.uv.extra-build-variables]
 deep-gemm = { DG_FORCE_BUILD = "1", DG_USE_LOCAL_VERSION = "0" }
+# Build only the PyTorch framework, skip the NCCL-based EP comm, target Hopper
+# (CUTLASS grouped GEMM) and Blackwell.
+transformer-engine = { NVTE_FRAMEWORK = "pytorch", NVTE_WITH_NCCL_EP = "0", NVTE_CUDA_ARCHS = "90;100" }
 
 [tool.mypy]
 follow_imports = "skip"

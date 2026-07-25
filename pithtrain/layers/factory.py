@@ -28,6 +28,6 @@ def get_group_linear_cls():
         from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinear
 
         return FP8GroupLinear
-    from pithtrain.layers.group_linear import GroupLinear
+    from pithtrain.layers.te_group_linear import TEGroupLinear
 
-    return GroupLinear
+    return TEGroupLinear
