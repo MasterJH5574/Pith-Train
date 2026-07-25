@@ -18,7 +18,7 @@ dev = ["pre-commit", "pytest", "ruff"]
 
 [build-system]
 build-backend = "setuptools.build_meta"
-requires = ["setuptools>=61"]
+requires = ["setuptools>=61", "wheel", "torch>=2.10.0"]
 
 [tool.setuptools.packages.find]
 include = ["pithtrain*"]
@@ -35,6 +35,11 @@ deep-gemm = { git = "https://github.com/deepseek-ai/DeepGEMM", branch = "main" }
 torch = { index = "torch-cu130" }
 
 [tool.uv.extra-build-dependencies]
+pithtrain = [
+    "torch>=2.10.0",
+    "setuptools",
+    "wheel",
+]
 deep-gemm = [
     "torch>=2.10.0",
     "packaging",
