@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from flash_attn.cute.interface import flash_attn_func
+import transformer_engine.pytorch as te
 from torch import nn
 
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
@@ -16,7 +16,7 @@ from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_fo
 from pithtrain.dualpipe.utils import FP8WeightCacheControl, run_backward
 from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinearFunc
 from pithtrain.layers.factory import ModelImplMode, get_linear_cls
-from pithtrain.layers.group_linear import GroupLinearFunc
+from pithtrain.layers.te_group_linear import TEGroupLinearFunc
 from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
@@ -226,7 +226,9 @@ class GptOssExperts(nn.Module):
             return FP8GroupLinearFunc.apply(
                 x, weight, offs, ks, ks_tensor, self._quantized_weight(name, weight), group_indices
             )
-        return GroupLinearFunc.apply(x, weight, offs)
+        # BF16 experts run on TE grouped GEMM; convert cumulative offs -> m_splits.
+        m_splits = ks if ks is not None else torch.diff(offs, prepend=offs.new_zeros(1)).tolist()
+        return TEGroupLinearFunc.apply(x, weight, m_splits)
 
     def forward(
         self,
@@ -370,7 +372,7 @@ class GptOssMLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Attention (GQA + sinks via Flex Attention)
+# Attention (GQA + sinks via TransformerEngine)
 # ---------------------------------------------------------------------------
 
 
@@ -378,11 +380,11 @@ class GptOssAttention(nn.Module):
     """
     Grouped Query Attention with attention sinks and optional sliding window.
 
-    Backed by FlashAttention-4 (CUTE DSL).  learnable_sink is a per-head
-    scalar fused into the softmax denominator inside the kernel — letting a
-    head "dump" attention mass to the sink and produce near-zero attention to
-    real tokens.  Causal + sliding window + GQA + per-head sink are all
-    native kwargs, so attention runs in a single FA-4 kernel call.
+    Backed by TransformerEngine's DotProductAttention with softmax_type
+    "learnable": a per-head sink scalar is fused into the softmax denominator,
+    letting a head "dump" attention mass to the sink and produce near-zero
+    attention to real tokens.  Causal masking, sliding window, and GQA are all
+    native to the attention core, so attention runs in a single TE call.
     """
 
     def __init__(
@@ -410,7 +412,26 @@ class GptOssAttention(nn.Module):
         self.v_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
         self.o_proj = LinearCls(num_attention_heads * head_dim, hidden_size, bias=attention_bias)
 
+        # Fused causal GQA attention with a learnable per-head sink. Sliding
+        # layers restrict the window to (W-1, 0) = self + W-1 prior tokens.
+        window_size = (self.sliding_window - 1, 0) if self.is_sliding else None
+        self.core_attention = te.DotProductAttention(
+            num_attention_heads=num_attention_heads,
+            kv_channels=head_dim,
+            num_gqa_groups=num_key_value_heads,
+            qkv_format="bshd",
+            attn_mask_type="causal",
+            window_size=window_size,
+            softmax_scale=self.scaling,
+            softmax_type="learnable",
+            attention_dropout=0.0,
+        )
+
+        # gpt-oss's per-head learnable sink IS TE's softmax offset; share the
+        # same parameter so it feeds the fused sink-softmax and trains
+        # end-to-end. TE casts it to fp32 internally at attention time.
         self.sinks = nn.Parameter(torch.zeros(num_attention_heads))
+        self.core_attention.softmax_offset = self.sinks
 
     def forward(
         self,
@@ -428,24 +449,11 @@ class GptOssAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # FA-4 expects (B, S, H, D); GQA is auto-detected from H_q vs H_kv.
-        # Sliding window: (W-1, 0) means each query attends to W tokens (self
-        # + W-1 prior).
-        window_size: Tuple[Optional[int], Optional[int]] = (
-            (self.sliding_window - 1, 0) if self.is_sliding else (None, None)
-        )
-        # FA-4 requires learnable_sink to match q/k/v dtype; the parameter
-        # itself stays in fp32 for optimizer numerical stability.
-        # flash_attn_func returns (out, lse); we only need out.
-        attn_output, _ = flash_attn_func(
-            query_states,
-            key_states,
-            value_states,
-            softmax_scale=self.scaling,
-            causal=True,
-            window_size=window_size,
-            learnable_sink=self.sinks.to(query_states.dtype),
-        )
+        # Fused causal GQA attention. The per-head learnable sink (self.sinks,
+        # shared with TE's softmax_offset) and, for sliding layers, the window
+        # are baked into the attention core. Output is flattened to
+        # [bsz, seq_len, num_heads * head_dim].
+        attn_output = self.core_attention(query_states, key_states, value_states.contiguous())
 
         attn_output = attn_output.reshape(bsz, seq_len, self.num_heads * self.head_dim)
         attn_output = self.o_proj(attn_output)
@@ -502,8 +510,8 @@ class GptOssDecoderLayer(nn.Module):
             ep_group=ep_group,
         )
 
-        self.input_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.input_layernorm = te.RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.post_attention_layernorm = te.RMSNorm(hidden_size, eps=rms_norm_eps)
 
     def _forward_attn_compute(self, hidden_states: torch.Tensor):
         residual = hidden_states
@@ -706,7 +714,7 @@ class GptOssModel(nn.Module):
         )
 
         if stage_id == num_stages - 1:
-            self.norm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
+            self.norm = te.RMSNorm(hidden_size, eps=rms_norm_eps)
             self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         else:
             self.norm = None

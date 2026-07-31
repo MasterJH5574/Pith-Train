@@ -7,7 +7,11 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import transformer_engine.pytorch as te
 from torch import nn
+from transformer_engine.pytorch.attention.rope import (
+    apply_rotary_pos_emb as te_apply_rotary_pos_emb,
+)
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
@@ -18,9 +22,7 @@ from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_li
 from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
-from pithtrain.operators.flash_attn_v4 import mla_flash_attn_func
-from pithtrain.operators.ring_attention.standard import ring_attention_func
-from pithtrain.operators.silu_mul import silu_mul
+from pithtrain.operators.te_swiglu import te_swiglu
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
     precompute_group_indices,
@@ -156,29 +158,6 @@ class DeepseekV2LiteYarnRotaryEmbedding(DeepseekV2LiteRotaryEmbedding):
         self.register_buffer("sin_cached", (emb.sin() * _mscale).to(dtype), persistent=False)
 
 
-# Copied from transformers.models.llama.modeling_llama.rotate_half
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1) -> Tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    b, h, s, d = q.shape
-    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-
-    b, h, s, d = k.shape
-    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
 class DeepseekV2LiteMLP(nn.Module):
     def __init__(
         self,
@@ -198,7 +177,7 @@ class DeepseekV2LiteMLP(nn.Module):
     def forward(self, x):
         g = self.gate_proj(x)
         u = self.up_proj(x)
-        return self.down_proj(silu_mul(g, u))
+        return self.down_proj(te_swiglu(g, u))
 
 
 class DeepseekV2LiteExperts(nn.Module):
@@ -230,7 +209,7 @@ class DeepseekV2LiteExperts(nn.Module):
         kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=gi)
         g = self.gate_proj(x, **kwargs)
         u = self.up_proj(x, **kwargs)
-        return self.down_proj(silu_mul(g, u), **kwargs)
+        return self.down_proj(te_swiglu(g, u), **kwargs)
 
 
 class DeepseekV2LiteMoEGate(nn.Module):
@@ -357,8 +336,6 @@ class DeepseekV2LiteAttention(nn.Module):
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
 
         self.cp_group = cp_group
-        self.use_ring_attn = cp_group is not None and cp_group.size() > 1
-        self._disable_ring_attn = False
 
         LinearCls = get_linear_cls()
         self.q_proj = LinearCls(self.hidden_size, self.num_heads * self.q_head_dim, bias=False)
@@ -367,7 +344,7 @@ class DeepseekV2LiteAttention(nn.Module):
             config.kv_lora_rank + config.qk_rope_head_dim,
             bias=False,
         )
-        self.kv_a_layernorm = nn.RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_a_layernorm = te.RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = LinearCls(
             config.kv_lora_rank,
             self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
@@ -377,10 +354,33 @@ class DeepseekV2LiteAttention(nn.Module):
         self.o_proj = LinearCls(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
         self.softmax_scale = self.q_head_dim ** (-0.5)
 
+        # Fused softmax-attention core (TransformerEngine / cuDNN). MLA uses
+        # asymmetric head dims, so kv_channels is (k_channel, v_channel):
+        # keys carry the concatenated nope+rope dim, values carry v_head_dim.
+        self.core_attention = te.DotProductAttention(
+            num_attention_heads=self.num_heads,
+            kv_channels=(self.q_head_dim, self.v_head_dim),
+            qkv_format="bshd",
+            attn_mask_type="causal",
+            softmax_scale=self.softmax_scale,
+            attention_dropout=0.0,
+        )
+
+        # Context parallelism runs inside TE's attention core (P2P ring KV
+        # exchange). With CP size 1 (or no cp_group) this is skipped and the
+        # core uses its non-CP path.
+        if cp_group is not None and cp_group.size() > 1:
+            self.core_attention.set_context_parallel_group(
+                cp_group,
+                dist.get_process_group_ranks(cp_group),
+                torch.cuda.Stream(),
+                cp_comm_type="p2p",
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor] = None,
+        rope_freqs: torch.Tensor = None,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
@@ -398,30 +398,23 @@ class DeepseekV2LiteAttention(nn.Module):
         )
 
         k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        cos, sin = position_embeddings
-        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
+        # Apply rotary embedding to the pe portion via TE's fused rope kernel.
+        # DeepSeek MLA uses interleaved (GPT-J) rotary pairs; freqs are the
+        # YARN-corrected angles, so TE reproduces the reference rotation.
+        q_pe = te_apply_rotary_pos_emb(
+            q_pe, rope_freqs, tensor_format="bshd", interleaved=True, fused=True
+        )
+        k_pe = te_apply_rotary_pos_emb(
+            k_pe, rope_freqs, tensor_format="bshd", interleaved=True, fused=True
+        )
 
-        if self.use_ring_attn and not self._disable_ring_attn:
-            query_states = torch.cat([q_nope, q_pe], dim=-1)
-            key_states = torch.cat([k_nope, k_pe.expand(-1, -1, self.num_heads, -1)], dim=-1)
-            attn_output = ring_attention_func(
-                query_states,
-                key_states,
-                value_states.contiguous(),
-                softmax_scale=self.softmax_scale,
-                cp_group=self.cp_group,
-            )
-        else:
-            attn_output = mla_flash_attn_func(
-                q_nope,
-                q_pe,
-                k_nope,
-                k_pe,
-                value_states,
-                softmax_scale=self.softmax_scale,
-                qk_nope_head_dim=self.qk_nope_head_dim,
-                causal=True,
-            )
+        # Assemble per-head Q/K (rope part is shared across heads, so broadcast
+        # k_pe) and run the fused causal attention core. TE returns the output
+        # already flattened to [bsz, q_len, num_heads * v_head_dim] and handles
+        # context parallelism internally when a CP group was configured.
+        query_states = torch.cat([q_nope, q_pe], dim=-1)
+        key_states = torch.cat([k_nope, k_pe.expand(-1, -1, self.num_heads, -1)], dim=-1)
+        attn_output = self.core_attention(query_states, key_states, value_states.contiguous())
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
         attn_output = self.o_proj(attn_output)
@@ -452,13 +445,14 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
             )
             else DeepseekV2LiteMLP(config)
         )
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        if self.self_attn.use_ring_attn:
-            self._forward_attn_compute = self._forward_attn_compute.__wrapped__.__get__(
-                self, type(self)
-            )
+        # The TE attention core (with optional CP) is not fullgraph-traceable,
+        # so run the attention block eagerly.
+        self._forward_attn_compute = self._forward_attn_compute.__wrapped__.__get__(
+            self, type(self)
+        )
 
     @torch.compile(fullgraph=True)
     def _forward_attn_compute(
@@ -468,13 +462,13 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        position_embeddings = getattr(self, "_position_embeddings", None)
-        if position_embeddings is None:
-            raise RuntimeError("Position embeddings must be set before calling forward_attn")
+        rope_freqs = getattr(self, "_rope_freqs", None)
+        if rope_freqs is None:
+            raise RuntimeError("Rotary frequencies must be set before calling forward_attn")
 
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
+            rope_freqs=rope_freqs,
         )
         hidden_states = residual + hidden_states
         # Fully Connected
@@ -610,18 +604,14 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        position_embeddings = getattr(self, "_position_embeddings", None)
-        if position_embeddings is None:
-            raise RuntimeError("Position embeddings must be set before calling reference_forward")
+        rope_freqs = getattr(self, "_rope_freqs", None)
+        if rope_freqs is None:
+            raise RuntimeError("Rotary frequencies must be set before calling reference_forward")
 
-        self.self_attn._disable_ring_attn = True
-        try:
-            hidden_states = self.self_attn(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-            )
-        finally:
-            self.self_attn._disable_ring_attn = False
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            rope_freqs=rope_freqs,
+        )
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -672,8 +662,8 @@ class DeepseekV2LiteModel(nn.Module):
             }
         )
         if stage_id == num_stages - 1:
-            self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.lm_head = get_linear_cls()(config.hidden_size, config.vocab_size, bias=False)
         else:
             self.norm = None
             self.lm_head = None
@@ -715,13 +705,16 @@ class DeepseekV2LiteModel(nn.Module):
 
         seq_len = hidden_states.shape[1]
         offset = self.cp_rank * seq_len
-        cos, sin = self.rotary_emb(hidden_states, seq_len=offset + seq_len)
-        position_embeddings = (
-            cos[offset : offset + seq_len].unsqueeze(0).to(dtype=hidden_states.dtype),
-            sin[offset : offset + seq_len].unsqueeze(0).to(dtype=hidden_states.dtype),
+        # Rotary frequencies for TE's fused rope: the YARN-corrected angles for
+        # this rank's positions, interleaved-doubled to fp32 [seq, 1, 1, rope_dim].
+        # TE consumes freqs (not cos/sin) and applies the rotation in its kernel.
+        positions = torch.arange(
+            offset, offset + seq_len, device=hidden_states.device, dtype=torch.float32
         )
+        angles = torch.outer(positions, self.rotary_emb.inv_freq.float())
+        rope_freqs = torch.stack((angles, angles), dim=-1).reshape(seq_len, 1, 1, -1)
         for _, layer in self.layers.items():
-            layer._position_embeddings = position_embeddings
+            layer._rope_freqs = rope_freqs
 
         if intermediate_tensors is None:
             for _, layer in self.layers.items():

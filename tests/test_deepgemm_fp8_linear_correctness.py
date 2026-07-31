@@ -9,6 +9,7 @@ when ``deep_gemm`` is not installed.
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 try:
     import deep_gemm  # noqa: F401
@@ -199,15 +200,14 @@ def test_fp8_linear_weight_grad_store():
     [(4, 128, 256), (8, 256, 512), (2, 256, 128)],
 )
 def test_fp8_group_linear_forward(num_groups, in_features, out_features):
-    """FP8GroupLinear forward output is close to BF16 GroupLinear."""
+    """FP8GroupLinear forward output is close to the BF16 F.grouped_mm reference."""
     from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinear
-    from pithtrain.layers.group_linear import GroupLinear
     from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 
-    bf16_gl = GroupLinear(num_groups, in_features, out_features).cuda().to(torch.bfloat16)
-    nn.init.normal_(bf16_gl.weight, std=0.02)
+    weight = torch.empty(num_groups, out_features, in_features, device="cuda", dtype=torch.bfloat16)
+    nn.init.normal_(weight, std=0.02)
     fp8_gl = FP8GroupLinear(num_groups, in_features, out_features).cuda().to(torch.bfloat16)
-    fp8_gl.weight.data.copy_(bf16_gl.weight.data)
+    fp8_gl.weight.data.copy_(weight)
 
     # Create tokens with known group assignments
     tokens_per_group = 16
@@ -222,7 +222,7 @@ def test_fp8_group_linear_forward(num_groups, in_features, out_features):
 
     gi = _make_group_indices(grouped_mm_offs, output_tokens.shape[0])
 
-    out_bf16 = bf16_gl(output_tokens, grouped_mm_offs)
+    out_bf16 = F.grouped_mm(output_tokens, weight.transpose(1, 2), offs=grouped_mm_offs)
     out_fp8 = fp8_gl(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=gi)
 
     assert out_fp8.shape == out_bf16.shape
@@ -239,16 +239,15 @@ def test_fp8_group_linear_forward(num_groups, in_features, out_features):
 
 @requires_deep_gemm
 def test_fp8_group_linear_backward():
-    """FP8GroupLinear backward produces gradients close to BF16."""
+    """FP8GroupLinear backward produces gradients close to the BF16 F.grouped_mm reference."""
     from pithtrain.layers.deepgemm_fp8_linear import FP8GroupLinear
-    from pithtrain.layers.group_linear import GroupLinear
     from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 
     num_groups, in_f, out_f = 4, 128, 256
-    bf16_gl = GroupLinear(num_groups, in_f, out_f).cuda().to(torch.bfloat16)
-    nn.init.normal_(bf16_gl.weight, std=0.02)
+    weight = torch.empty(num_groups, out_f, in_f, device="cuda", dtype=torch.bfloat16)
+    nn.init.normal_(weight, std=0.02)
     fp8_gl = FP8GroupLinear(num_groups, in_f, out_f).cuda().to(torch.bfloat16)
-    fp8_gl.weight.data.copy_(bf16_gl.weight.data)
+    fp8_gl.weight.data.copy_(weight)
 
     tokens_per_group = 16
     M_total = num_groups * tokens_per_group
@@ -262,11 +261,12 @@ def test_fp8_group_linear_backward():
     gi = _make_group_indices(grouped_mm_offs, output_tokens.shape[0])
 
     x_bf16 = output_tokens.detach().clone().requires_grad_(True)
+    w_bf16 = weight.detach().clone().requires_grad_(True)
     x_fp8 = output_tokens.detach().clone().requires_grad_(True)
 
     grad = _make_bf16((output_tokens.shape[0], out_f))
 
-    bf16_gl(x_bf16, grouped_mm_offs).backward(grad)
+    F.grouped_mm(x_bf16, w_bf16.transpose(1, 2), offs=grouped_mm_offs).backward(grad)
     fp8_gl(x_fp8, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=gi).backward(grad)
 
     # Input grad check - tensors are exactly sized (no over-allocation)
@@ -276,8 +276,8 @@ def test_fp8_group_linear_backward():
 
     # Weight grad check
     assert fp8_gl.weight.grad is not None
-    assert bf16_gl.weight.grad is not None
-    diff = calc_diff(fp8_gl.weight.grad, bf16_gl.weight.grad)
+    assert w_bf16.grad is not None
+    diff = calc_diff(fp8_gl.weight.grad, w_bf16.grad)
     assert diff < ERR_THRESHOLD, f"weight grad diff = {diff}"
 
 
@@ -379,14 +379,14 @@ def test_fp8_group_linear_empty_input():
 def test_factory_functions_bf16_mode():
     """get_linear_cls / get_group_linear_cls return BF16 classes by default."""
     from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
-    from pithtrain.layers.group_linear import GroupLinear
+    from pithtrain.layers.te_group_linear import TEGroupLinear
 
     # Ensure default mode
     prev = ModelImplMode.fp8_training
     try:
         ModelImplMode.fp8_training = "disabled"
         assert get_linear_cls() is nn.Linear
-        assert get_group_linear_cls() is GroupLinear
+        assert get_group_linear_cls() is TEGroupLinear
     finally:
         ModelImplMode.fp8_training = prev
 

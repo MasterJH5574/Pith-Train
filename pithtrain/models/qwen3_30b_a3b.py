@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import transformer_engine.pytorch as te
 from torch import nn
 
 from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
@@ -16,9 +17,7 @@ from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_li
 from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
-from pithtrain.operators.flash_attn_v4 import flash_attn_func
-from pithtrain.operators.ring_attention.standard import ring_attention_func
-from pithtrain.operators.silu_mul import silu_mul
+from pithtrain.operators.te_swiglu import te_swiglu
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
     precompute_group_indices,
@@ -144,7 +143,7 @@ class Qwen3MoeMLP(nn.Module):
         self.down_proj = LinearCls(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(silu_mul(self.gate_proj(x), self.up_proj(x)))
+        return self.down_proj(te_swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Qwen3MoeExperts(nn.Module):
@@ -177,7 +176,7 @@ class Qwen3MoeExperts(nn.Module):
         kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=gi)
         g = self.gate_proj(x, **kwargs)
         u = self.up_proj(x, **kwargs)
-        return self.down_proj(silu_mul(g, u), **kwargs)
+        return self.down_proj(te_swiglu(g, u), **kwargs)
 
 
 class Qwen3MoeGate(nn.Module):
@@ -345,8 +344,6 @@ class Qwen3MoeAttention(nn.Module):
         self.num_key_value_groups = num_attention_heads // num_key_value_heads
         self.scaling = head_dim**-0.5
         self.cp_group = cp_group
-        self.use_ring_attn = cp_group is not None and cp_group.size() > 1
-        self._disable_ring_attn = False
 
         LinearCls = get_linear_cls()
         self.q_proj = LinearCls(hidden_size, num_attention_heads * head_dim, bias=attention_bias)
@@ -354,8 +351,30 @@ class Qwen3MoeAttention(nn.Module):
         self.v_proj = LinearCls(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
         self.o_proj = LinearCls(num_attention_heads * head_dim, hidden_size, bias=attention_bias)
 
-        self.q_norm = nn.RMSNorm(head_dim, eps=rms_norm_eps)
-        self.k_norm = nn.RMSNorm(head_dim, eps=rms_norm_eps)
+        self.q_norm = te.RMSNorm(head_dim, eps=rms_norm_eps)
+        self.k_norm = te.RMSNorm(head_dim, eps=rms_norm_eps)
+
+        # Fused causal GQA attention core (TransformerEngine / cuDNN). GQA is
+        # expressed via num_gqa_groups = num_key_value_heads.
+        self.core_attention = te.DotProductAttention(
+            num_attention_heads=num_attention_heads,
+            kv_channels=head_dim,
+            num_gqa_groups=num_key_value_heads,
+            qkv_format="bshd",
+            attn_mask_type="causal",
+            softmax_scale=self.scaling,
+            attention_dropout=0.0,
+        )
+
+        # Context parallelism runs inside TE's attention core (P2P ring KV
+        # exchange). With CP size 1 (or no cp_group) this is skipped.
+        if cp_group is not None and cp_group.size() > 1:
+            self.core_attention.set_context_parallel_group(
+                cp_group,
+                dist.get_process_group_ranks(cp_group),
+                torch.cuda.Stream(),
+                cp_comm_type="p2p",
+            )
 
     def forward(
         self,
@@ -393,22 +412,10 @@ class Qwen3MoeAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if not self.use_ring_attn or self._disable_ring_attn:
-            attn_output = flash_attn_func(
-                query_states,
-                key_states,
-                value_states,
-                softmax_scale=self.scaling,
-                causal=True,
-            )
-        else:
-            attn_output = ring_attention_func(
-                query_states,
-                key_states,
-                value_states,
-                softmax_scale=self.scaling,
-                cp_group=self.cp_group,
-            )
+        # Fused causal GQA attention; TE handles context parallelism internally
+        # when a CP group was configured. Output is flattened to
+        # [bsz, seq_len, num_heads * head_dim].
+        attn_output = self.core_attention(query_states, key_states, value_states.contiguous())
 
         attn_output = attn_output.reshape(bsz, seq_len, self.num_heads * self.head_dim)
         attn_output = self.o_proj(attn_output)
@@ -480,13 +487,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
         else:
             self.mlp = Qwen3MoeMLP(hidden_size, intermediate_size)
 
-        self.input_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.input_layernorm = te.RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.post_attention_layernorm = te.RMSNorm(hidden_size, eps=rms_norm_eps)
 
-        if self.self_attn.use_ring_attn:
-            self._forward_attn_compute = self._forward_attn_compute.__wrapped__.__get__(
-                self, type(self)
-            )
+        # The TE attention core (with optional CP) is not fullgraph-traceable,
+        # so run the attention block eagerly.
+        self._forward_attn_compute = self._forward_attn_compute.__wrapped__.__get__(
+            self, type(self)
+        )
 
     @torch.compile(fullgraph=True)
     def _forward_attn_compute(
@@ -633,14 +641,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
         if position_embeddings is None:
             raise RuntimeError("Position embeddings must be set before calling reference_forward")
 
-        self.self_attn._disable_ring_attn = True
-        try:
-            hidden_states = self.self_attn(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-            )
-        finally:
-            self.self_attn._disable_ring_attn = False
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -725,7 +729,7 @@ class Qwen3MoeModel(nn.Module):
         )
 
         if stage_id == num_stages - 1:
-            self.norm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
+            self.norm = te.RMSNorm(hidden_size, eps=rms_norm_eps)
             self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         else:
             self.norm = None

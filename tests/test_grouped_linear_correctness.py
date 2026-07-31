@@ -1,5 +1,5 @@
 """
-Correctness test for F.grouped_mm and GroupLinear.
+Correctness test for F.grouped_mm (the reference MoE expert GEMM).
 
 This test compares the F.grouped_mm implementation against a reference
 for-loop based matmul implementation to ensure correctness.
@@ -10,7 +10,6 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
-from pithtrain.layers.group_linear import GroupLinear
 from pithtrain.operators.token_scatter import _GEMM_ALLOC_ALIGNMENT, scatter_for_grouped_gemm
 
 
@@ -205,65 +204,6 @@ def test_grouped_linear_backward():
         assert torch.allclose(grad_weight_test, grad_weight_ref, rtol=1e-5, atol=1e-6), (
             f"Weight gradient mismatch for '{test_name}'! Max diff: {max_diff_weight}"
         )
-
-
-def test_group_linear_module():
-    """Test GroupLinear module (wrapper around F.grouped_mm)."""
-    device = torch.device("cuda")
-    dtype = torch.float32
-
-    # Configuration
-    num_groups = 8
-    group_sizes = [5, 0, 3, 0, 0, 2, 0, 1]
-    in_features = 128
-    out_features = 256
-
-    # Create module
-    module = GroupLinear(num_groups, in_features, out_features).to(device).to(dtype)
-
-    # Create packed input
-    M_total = sum(group_sizes)
-    input = torch.randn(M_total, in_features, device=device, dtype=dtype, requires_grad=True)
-
-    # Create grouped_mm_offs
-    grouped_mm_offs = torch.tensor(group_sizes, device=device).cumsum(0).to(torch.int32)
-
-    # Forward pass
-    output = module(input, grouped_mm_offs)
-
-    # Reference forward
-    output_ref = reference_grouped_linear_forward(
-        input.detach(), module.weight.detach(), grouped_mm_offs
-    )
-
-    # Compare forward
-    max_diff = (output - output_ref).abs().max().item()
-    assert torch.allclose(output, output_ref, rtol=1e-5, atol=1e-6), (
-        f"Module forward mismatch! Max diff: {max_diff}"
-    )
-
-    # Backward pass
-    grad_output = torch.randn_like(output)
-    output.backward(grad_output)
-
-    grad_input_test = input.grad.clone()
-    grad_weight_test = module.weight.grad.clone()
-
-    # Reference backward
-    grad_input_ref, grad_weight_ref = reference_grouped_linear_backward(
-        grad_output, input.detach(), module.weight.detach(), grouped_mm_offs
-    )
-
-    # Compare backward
-    max_diff_input = (grad_input_test - grad_input_ref).abs().max().item()
-    max_diff_weight = (grad_weight_test - grad_weight_ref).abs().max().item()
-
-    assert torch.allclose(grad_input_test, grad_input_ref, rtol=1e-5, atol=1e-6), (
-        f"Module input gradient mismatch! Max diff: {max_diff_input}"
-    )
-    assert torch.allclose(grad_weight_test, grad_weight_ref, rtol=1e-5, atol=1e-6), (
-        f"Module weight gradient mismatch! Max diff: {max_diff_weight}"
-    )
 
 
 def test_edge_cases():
@@ -589,69 +529,14 @@ def test_scatter_then_grouped_mm_end_to_end():
         )
 
 
-def test_group_linear_weight_grad_store():
-    """GroupLinear correctly defers weight gradients via WeightGradStore."""
-    from pithtrain.dualpipe.utils import WeightGradStore
-
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-
-    num_groups, in_features, out_features = 4, 128, 256
-    group_sizes = [16, 8, 12, 4]
-    M_total = sum(group_sizes)
-    grouped_mm_offs = torch.tensor(group_sizes, device=device).cumsum(0).to(torch.int32)
-
-    gl_ref = GroupLinear(num_groups, in_features, out_features).to(device).to(dtype)
-    torch.nn.init.normal_(gl_ref.weight, std=0.02)
-
-    x_raw = torch.randn(M_total, in_features, device=device, dtype=dtype)
-    grad = torch.randn(M_total, out_features, device=device, dtype=dtype)
-
-    # Reference: no WeightGradStore.
-    x_ref = x_raw.detach().clone().requires_grad_(True)
-    gl_ref(x_ref, grouped_mm_offs).backward(grad)
-    ref_weight_grad = gl_ref.weight.grad.clone()
-    ref_input_grad = x_ref.grad.clone()
-
-    # Deferred path.
-    gl = GroupLinear(num_groups, in_features, out_features).to(device).to(dtype)
-    gl.weight.data.copy_(gl_ref.weight.data)
-    x_def = x_raw.detach().clone().requires_grad_(True)
-
-    WeightGradStore.enabled = True
-    try:
-        gl(x_def, grouped_mm_offs).backward(grad)
-
-        assert gl.weight.grad is None, "Weight grad should be deferred"
-        assert x_def.grad is not None, "Input grad should be on the critical path"
-
-        input_diff = (x_def.grad - ref_input_grad).abs().max().item()
-        assert torch.allclose(x_def.grad, ref_input_grad, rtol=1e-3, atol=1e-3), (
-            f"Input grad diff = {input_diff}"
-        )
-
-        WeightGradStore.flush()
-        WeightGradStore.pop()
-
-        assert gl.weight.grad is not None, "Weight grad should exist after pop"
-        assert gl.weight.grad.shape == gl.weight.shape
-        weight_diff = (gl.weight.grad - ref_weight_grad).abs().max().item()
-        assert torch.allclose(gl.weight.grad, ref_weight_grad, rtol=1e-3, atol=1e-3), (
-            f"Deferred vs direct weight grad diff = {weight_diff}"
-        )
-    finally:
-        WeightGradStore.enabled = False
-        WeightGradStore.clear()
-
-
 def test_gpt_oss_experts_weight_grad_store_matches_direct():
     """
-    End-to-end sanity check: GptOssExperts (now backed by GroupLinearFunc for
+    End-to-end sanity check: GptOssExperts (now backed by TEGroupLinearFunc for
     the expert GEMMs) produces the same input / weight / bias gradients whether
     WeightGradStore is enabled or disabled.
 
     Only the expert-weight wgrad is routed through WeightGradStore; the bias
-    add lives outside GroupLinearFunc so its grad is computed eagerly via
+    add lives outside TEGroupLinearFunc so its grad is computed eagerly via
     autograd on both paths.
     """
     from pithtrain.dualpipe.utils import WeightGradStore
@@ -705,14 +590,14 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
 
         out_def.backward(grad)
 
-        # Expert weights go through GroupLinearFunc's deferred wgrad path.
+        # Expert weights go through TEGroupLinearFunc's deferred wgrad path.
         for p_def, name in [
             (experts_def.gate_up_proj, "gate_up_proj"),
             (experts_def.down_proj, "down_proj"),
         ]:
             assert p_def.grad is None, f"[deferred] {name} grad should be deferred"
 
-        # Biases are added outside GroupLinearFunc; autograd populates them eagerly.
+        # Biases are added outside TEGroupLinearFunc; autograd populates them eagerly.
         for p_def, name in [
             (experts_def.gate_up_proj_bias, "gate_up_proj_bias"),
             (experts_def.down_proj_bias, "down_proj_bias"),
