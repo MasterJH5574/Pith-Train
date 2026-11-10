@@ -544,6 +544,15 @@ class DualPipeV(nn.Module):
     def run_step(self, microbatches: List[Microbatch], objective: Optional[Callable]) -> List[Any]:
         self.forward_only = not torch.is_grad_enabled()
 
+        # Capturing synchronizes the device. Do it only here, while the pipeline is drained,
+        # using scratch inputs prepared by the preceding ordinary warmup step.
+        if training.cuda_graphs:
+            from pithtrain.pipeline.cuda_graphs import capture_pending
+
+            if any(microbatch.cu_seqlens is not None for microbatch in microbatches):
+                raise ValueError("cuda_graphs currently requires dense, unpacked micro-batches")
+            capture_pending()
+
         # ZeRO-1 for the step: no resharding, gradient sync or root post-backward callback after
         # each backward; the end of step() runs all three once.
         for module in self.module:

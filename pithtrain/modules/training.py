@@ -215,6 +215,12 @@ class TrainingCfg(SlottedDefault):
     Train the linear layers in FP8 through DeepGEMM with 128-element block scaling; False is BF16.
     """
 
+    cuda_graphs: bool = False
+    """
+    Replay Qwen3's compiled stage 1 and fused stage 5/1 forward/backward with CUDA graphs.
+    Standalone stage 5, dynamic expert compute and FSDP remain ordinary. See docs/cuda-graphs.md.
+    """
+
     init_std: float = 0.02
 
     nsys_start: Optional[int] = None
@@ -357,6 +363,7 @@ def setup_model(
     distributed_cfg: DistributedCfg,
 ) -> None:
     training.fp8 = cfg.fp8
+    training.cuda_graphs = cfg.cuda_graphs
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
 
@@ -365,6 +372,8 @@ def setup_model(
 
     modules = []
     module_config = AutoConfig.from_pretrained(cfg.model)
+    if cfg.cuda_graphs and module_config.model_type != "qwen3_moe":
+        raise ValueError("cuda_graphs currently supports only Qwen3 MoE")
     module_config.max_position_embeddings = cfg.sequence_length
 
     assert hasattr(module_config, "hidden_size")

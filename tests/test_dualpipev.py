@@ -275,6 +275,7 @@ def main(model_name: str):
     # The fused classes act as nn.Linear in the single-device reference; fused accumulation is
     # installed on the DualPipeV copy only, as setup_model does.
     training.fp8 = False
+    training.cuda_graphs = os.environ.get("CUDA_GRAPHS", "0") == "1"
     training.Linear = BF16Linear
     training.GroupedLinear = GroupedLinear
     if os.environ.get("FP8", "0") == "1":
@@ -588,6 +589,12 @@ def main(model_name: str):
 
     if distributed.rank == 0:
         print("[INFO] All gradients match the reference.", flush=True)
+    if training.cuda_graphs:
+        from pithtrain.pipeline.cuda_graphs import graph_stats
+
+        stats = graph_stats()
+        assert stats["forward_replays"] > 0 and stats["backward_replays"] > 0, stats
+        print(f"[INFO] rank-{distributed.rank}, CUDA graphs: {stats}", flush=True)
     torch.distributed.barrier()
 
     # Export before and after changing the weights to reject caches retained across syncs.
