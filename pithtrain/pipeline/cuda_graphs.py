@@ -93,6 +93,22 @@ def copy_view(x, dims):
     return x
 
 
+def copy_groups(tensors):
+    # Foreach's fused copy requires a homogeneous dtype and dense, non-overlapping layouts.
+    # Keep strided slices separate so one RoPE view cannot force every copy onto the slow path.
+    # Source/destination metadata match exactly and are guarded before each replay.
+    groups = {}
+    for i, tensor in enumerate(tensors):
+        key = (tensor.dtype, torch.ops.aten.is_non_overlapping_and_dense(tensor))
+        groups.setdefault(key, []).append(i)
+    return tuple(tuple(indices) for indices in groups.values())
+
+
+def copy_grouped(destinations, sources, groups):
+    for indices in groups:
+        torch._foreach_copy_([destinations[i] for i in indices], [sources[i] for i in indices])
+
+
 class StaticGraph:
     def __init__(self, fn, read_inputs, mutated_inputs, backward):
         self.fn = fn
@@ -130,9 +146,10 @@ class StaticGraph:
 
     def copy_inputs(self, args):
         if self.copy_destinations:
-            torch._foreach_copy_(
+            copy_grouped(
                 self.copy_destinations,
                 [copy_view(args[i], dims) for i, dims in self.copy_sources],
+                self.input_copy_groups,
             )
 
     def prepare(self, args):
@@ -158,6 +175,7 @@ class StaticGraph:
             if isinstance(args[i], torch.Tensor)
         ]
         self.copy_destinations = [copy_view(self.inputs[i], dims) for i, dims in self.copy_sources]
+        self.input_copy_groups = copy_groups(self.copy_destinations)
         self.copy_inputs(args)
 
     def capture(self):
@@ -199,6 +217,14 @@ class StaticGraph:
                         meta = None  # return the current input object itself
             source = copy_view(out, dims) if meta is not None and alias is None else out
             self.output_specs.append((alias, meta, dims, source))
+        self.output_copy_groups = copy_groups(
+            [self.inputs[i] for i in self.mutated_inputs]
+            + [
+                out
+                for alias, meta, dims, out in self.output_specs
+                if alias is None and meta is not None
+            ]
+        )
         self.graph = graph
         self.capture_seconds += time.perf_counter() - start
 
@@ -243,7 +269,7 @@ class StaticGraph:
                 sources.append(out)
                 result.append(escaped)
         if destinations:
-            torch._foreach_copy_(destinations, sources)
+            copy_grouped(destinations, sources, self.output_copy_groups)
         args.clear()
         return result
 

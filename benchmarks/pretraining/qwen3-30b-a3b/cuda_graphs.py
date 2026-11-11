@@ -2,6 +2,8 @@
 
 import argparse
 import json
+import os
+import socket
 import time
 from functools import partial
 from pathlib import Path
@@ -23,6 +25,8 @@ def main():
     parser.add_argument("--ep", type=int, default=8)
     parser.add_argument("--cp", type=int, default=1)
     parser.add_argument("--seq", type=int, default=2048)
+    parser.add_argument("--mbs", type=int, default=1)
+    parser.add_argument("--gbs", type=int, default=64)
     parser.add_argument("--steps", type=int)
     parser.add_argument("--fp8", action="store_true")
     parser.add_argument("--graphs", action="store_true")
@@ -44,7 +48,7 @@ def main():
     training.model = Path("examples/pretrain_lm/qwen3-30b-a3b")
     training.optimizer = make_adamw_optimizer
     training.moe_load_balance_type, training.moe_load_balance_coef = "global-batch", 1e-3
-    training.micro_batch_size, training.global_batch_size = 1, 64
+    training.micro_batch_size, training.global_batch_size = args.mbs, args.gbs
     training.sequence_length = args.seq
     training.fp8, training.benchmark, training.seed = args.fp8, args.performance, 1234
     training.max_steps = args.steps or (12 if args.performance else 32)
@@ -62,6 +66,10 @@ def main():
     def record(start, *, step=None, phase=None):
         stats = dict(
             rank=distributed.rank,
+            world_size=torch.distributed.get_world_size(),
+            hostname=socket.gethostname(),
+            slurm_job=os.environ.get("SLURM_JOB_ID"),
+            slurm_step=os.environ.get("SLURM_STEP_ID"),
             seconds=time.perf_counter() - start,
             peak_allocated=torch.cuda.max_memory_allocated(),
             peak_reserved=torch.cuda.max_memory_reserved(),

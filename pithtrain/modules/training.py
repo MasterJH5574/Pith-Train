@@ -217,8 +217,8 @@ class TrainingCfg(SlottedDefault):
 
     cuda_graphs: bool = False
     """
-    Replay Qwen3's compiled stage 1 and fused stage 5/1 forward/backward with CUDA graphs.
-    Standalone stage 5, dynamic expert compute and FSDP remain ordinary. See docs/cuda-graphs.md.
+    Replay Qwen3's compiled stage 1 forward/backward with CUDA graphs on every layer.
+    Aggregation, dynamic expert compute and FSDP remain ordinary. See docs/cuda-graphs.md.
     """
 
     init_std: float = 0.02

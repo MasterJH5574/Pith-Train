@@ -6,6 +6,49 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+def test_replay_copies_mixed_dtypes_and_layouts():
+    from pithtrain.pipeline.cuda_graphs import StaticGraph
+
+    def inputs():
+        dense = torch.randn(8, 16, device="cuda", dtype=torch.bfloat16)
+        return [
+            dense,
+            dense.float().t(),
+            torch.randn(8, 32, device="cuda", dtype=torch.bfloat16)[:, ::2],
+            torch.randint(0, 8, (8, 16), device="cuda"),
+            dense.to(torch.float8_e4m3fn),
+            torch.randn(8, 1, device="cuda").expand(8, 16),
+        ]
+
+    def fn(args):
+        dense, transposed, sliced, integer, fp8, expanded = args
+        transposed.add_(dense.t().float())
+        return [
+            dense + sliced,
+            transposed.square().t(),
+            (sliced * 2)[:, ::2],
+            integer + 1,
+            fp8.clone(),
+            expanded.sum().expand(3),
+        ]
+
+    graph = StaticGraph(fn, tuple(range(6)), (1,), backward=False)
+    graph(inputs())
+    graph.capture()
+    saved = []
+    for _ in range(3):
+        actual = inputs()
+        expected = [x.clone() for x in actual]
+        reference = fn(expected)
+        replay = graph(actual.copy())
+        torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+        saved.extend(zip(replay, reference))
+    for actual, expected in saved:
+        # Float8 comparison through float preserves the represented values.
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
+    assert graph.replays == 3
+
+
 def test_capture_preserves_nested_compiled_grad_mode():
     from pithtrain.pipeline.cuda_graphs import StaticGraph
 
@@ -106,6 +149,10 @@ def test_compiled_forward_backward_with_live_microbatches():
     from pithtrain.operators.linear import BF16LinearFunc
     from pithtrain.pipeline.cuda_graphs import capture_pending, compile_stage, graph_stats
 
+    @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
+    def aggregate(x, probabilities):
+        return (x * probabilities.unsqueeze(-1)).sum(dim=1)
+
     @compile_stage(options={"cpp_wrapper": True})
     def region(x, weight, bias, main_grad, counter):
         counter.add_(1)
@@ -115,7 +162,8 @@ def test_compiled_forward_backward_with_live_microbatches():
     torch.manual_seed(1234)
     weight0 = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16) * 0.05
     bias0 = torch.randn(32, device="cuda", dtype=torch.bfloat16) * 0.05
-    inputs = [torch.randn(16, 32, device="cuda", dtype=torch.bfloat16) for _ in range(12)]
+    inputs = [torch.randn(16, 4, 32, device="cuda", dtype=torch.bfloat16) for _ in range(12)]
+    probabilities = [torch.randn(16, 4, device="cuda", dtype=torch.bfloat16) for _ in inputs]
     results = []
     old_flag = training.cuda_graphs
     try:
@@ -131,13 +179,19 @@ def test_compiled_forward_backward_with_live_microbatches():
                 capture_pending()
                 main_grad.untyped_storage().resize_(0)
                 xs = [x.clone().requires_grad_() for x in inputs[step * 3 : step * 3 + 3]]
-                ys = [region(x, weight, bias, main_grad, counter) for x in xs]
+                ps = [p.clone().requires_grad_() for p in probabilities[step * 3 : step * 3 + 3]]
+                # Aggregation's backward stays ordinary and must receive fresh escaped gradients.
+                ys = [
+                    region(aggregate(x, p), weight, bias, main_grad, counter)
+                    for x, p in zip(xs, ps)
+                ]
                 main_grad.untyped_storage().resize_(main_grad.numel() * main_grad.element_size())
                 main_grad.zero_()
                 for y in reversed(ys):
                     y.float().square().sum().backward()
                 observed.extend([y.detach().clone() for y in ys])
                 observed.extend([x.grad.clone() for x in xs])
+                observed.extend([p.grad.clone() for p in ps])
                 observed.extend([main_grad.clone(), bias.grad.clone(), counter.clone()])
                 with torch.no_grad():
                     weight.add_(main_grad.to(weight.dtype), alpha=-0.01)
