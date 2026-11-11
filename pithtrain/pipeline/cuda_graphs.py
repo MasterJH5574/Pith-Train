@@ -1,5 +1,5 @@
 """
-CUDA graphs for Qwen3's compiled compute regions, below AOTAutograd and above Inductor.
+CUDA graphs for static compiled compute regions, below AOTAutograd and above Inductor.
 
 Each compiled forward/backward owns one scratch invocation. Inputs are refreshed on every call,
 mutations are copied back, and outputs escape to ordinary allocator storage. Saved activations

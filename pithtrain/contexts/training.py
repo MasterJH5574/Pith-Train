@@ -40,7 +40,7 @@ object, so they live here rather than being passed down.
 
 cuda_graphs: bool = False
 """
-Capture Qwen3 compiled forward/backward compute; selected by TrainingCfg at setup.
+Capture supported models' static forward/backward compute; selected by TrainingCfg at setup.
 """
 
 

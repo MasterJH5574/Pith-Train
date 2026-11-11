@@ -382,12 +382,23 @@ def main(model_name: str):
     torch.distributed.barrier()
 
     loss_refs = []
+    check_graph_outputs = training.cuda_graphs and config.model_type == "gpt_oss"
+    output_refs = []
     for step_index, chunks in enumerate(chunk_steps):
         if replay:
             install_router_replay(
                 full_modules, micro_batch_size, step_index * num_global_chunks, chunks
             )
-        loss_refs.append(reference_step(chunks, full_modules)[0])
+        losses, outputs = reference_step(chunks, full_modules)
+        loss_refs.append(losses)
+        if check_graph_outputs and pp_rank == 0:
+            output_refs.append(
+                [
+                    output.detach().cpu()
+                    for output in outputs[dp_rank * num_chunks : (dp_rank + 1) * num_chunks]
+                ]
+            )
+        del outputs
     if replay:
         # Catch replay ignored by both paths: the unused expert must have zero gradient.
         for n, p in full_modules.named_parameters():
@@ -444,7 +455,17 @@ def main(model_name: str):
         (output,), (target,) = model_outputs, objective_inputs
         return None, criterion(output, target)
 
+    def checked_objective(model_outputs, objective_inputs):
+        if check_graph_outputs:
+            (output,) = model_outputs
+            reference = output_refs[step_index][training.current_microbatch].to(output.device)
+            diff = calculate_difference(output.detach(), reference)
+            assert diff < 1e-3, (distributed.rank, step_index, training.current_microbatch, diff)
+            output_diffs.append(diff)
+        return objective(model_outputs, objective_inputs)
+
     for step_index, chunks in enumerate(chunk_steps):
+        output_diffs = []
         # Every pipeline rank builds the same micro-batches, so each derives its own P2P shapes;
         # only the first rank reads the tensors. dp picks the samples, then cp picks the zigzag
         # slice this rank takes from each one.
@@ -470,8 +491,15 @@ def main(model_name: str):
         with torch.no_grad():
             collected_outputs = dualpipev_model.step(microbatches, collect)
         assert records_empty(dualpipev_model), "a forward-only step kept activations"
-        objective_outputs = dualpipev_model.step(microbatches, objective)
+        objective_outputs = dualpipev_model.step(microbatches, checked_objective)
         assert records_empty(dualpipev_model), "a training step kept activations"
+        if check_graph_outputs and pp_rank == 0:
+            assert len(output_diffs) == num_chunks
+            print(
+                f"[INFO] rank-{distributed.rank}, step {step_index}, "
+                f"all {num_chunks} outputs match; maximum diff={max(output_diffs):.6g}",
+                flush=True,
+            )
 
         if distributed.rank == 0:
             print("[INFO] Completed DualPipeV step %d." % step_index, flush=True)
@@ -532,13 +560,22 @@ def main(model_name: str):
         # exempt: their gradients scale as 1/num_experts, so a fixed floor would skip them all on
         # a many-expert config.
         ref_max = param_ref.grad.abs().max().item()
-        if ref_max < 1e-5 and ".experts." not in param_name:
+        attention_sink_or_bias = ".self_attn." in param_name and param_name.endswith(
+            ("sinks", "bias")
+        )
+        if ref_max < 1e-5 and ".experts." not in param_name and not attention_sink_or_bias:
             print(
                 "[warn] rank-%d, Parameter %s grad max=%.2e at bf16 noise floor, skipping."
                 % (distributed.rank, param_name, ref_max)
             )
             continue
         diff = calculate_difference(param_grad, param_ref.grad)
+        if attention_sink_or_bias:
+            print(
+                f"[INFO] rank-{distributed.rank}, {param_name}: gradient diff={diff:.6g}, "
+                f"reference max={ref_max:.6g}",
+                flush=True,
+            )
         if diff > largest_diff:
             largest_diff = diff
             largest_diff_param = param_name
@@ -590,10 +627,15 @@ def main(model_name: str):
     if distributed.rank == 0:
         print("[INFO] All gradients match the reference.", flush=True)
     if training.cuda_graphs:
-        from pithtrain.pipeline.cuda_graphs import graph_stats
+        from pithtrain.pipeline.cuda_graphs import MAX_GRAPHS, graph_stats
 
         stats = graph_stats()
-        assert stats["forward_replays"] > 0 and stats["backward_replays"] > 0, stats
+        expected_replays = num_chunks * sum(len(module.layers) for module in local_modules)
+        if not ragged:
+            assert stats["forward_replays"] == stats["backward_replays"] == expected_replays, stats
+        else:
+            assert stats["forward_replays"] > 0 and stats["backward_replays"] > 0, stats
+        assert 0 < stats["instances"] <= MAX_GRAPHS, stats
         print(f"[INFO] rank-{distributed.rank}, CUDA graphs: {stats}", flush=True)
     torch.distributed.barrier()
 

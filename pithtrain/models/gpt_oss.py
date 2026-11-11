@@ -37,6 +37,7 @@ from pithtrain.operators.token_scatter import (
     precompute_group_indices,
     scatter_for_grouped_gemm,
 )
+from pithtrain.pipeline.cuda_graphs import compile_stage
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
@@ -377,7 +378,7 @@ class GptOssDecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    @torch.compile(fullgraph=True, options={"cpp_wrapper": True, **stage_compile_options()})
+    @compile_stage(options={"cpp_wrapper": True, **stage_compile_options()})
     def forward_stage1_compute(
         self,
         hidden_states: torch.Tensor,

@@ -217,7 +217,7 @@ class TrainingCfg(SlottedDefault):
 
     cuda_graphs: bool = False
     """
-    Replay Qwen3's compiled stage 1 forward/backward with CUDA graphs on every layer.
+    Replay Qwen3 MoE / GPT-OSS static stage 1 forward/backward with CUDA graphs on every layer.
     Aggregation, dynamic expert compute and FSDP remain ordinary. See docs/cuda-graphs.md.
     """
 
@@ -372,8 +372,8 @@ def setup_model(
 
     modules = []
     module_config = AutoConfig.from_pretrained(cfg.model)
-    if cfg.cuda_graphs and module_config.model_type != "qwen3_moe":
-        raise ValueError("cuda_graphs currently supports only Qwen3 MoE")
+    if cfg.cuda_graphs and module_config.model_type not in ("qwen3_moe", "gpt_oss"):
+        raise ValueError("cuda_graphs currently supports only Qwen3 MoE and GPT-OSS")
     module_config.max_position_embeddings = cfg.sequence_length
 
     assert hasattr(module_config, "hidden_size")

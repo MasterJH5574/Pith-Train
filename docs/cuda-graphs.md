@@ -1,10 +1,10 @@
-# CUDA graphs for Qwen3 training
+# CUDA graphs for training
 
 Set `cfg.training.cuda_graphs = True` to opt into CUDA graph replay. The default is `False`;
 use separate processes with otherwise identical configurations for comparisons. The implementation
 uses the pinned PyTorch 2.13 Inductor/AOTAutograd interfaces.
 
-The captured regions are Qwen3 MoE's compiled stage 1 and its compiled backward on every layer.
+Qwen3 MoE captures its compiled stage 1 and its compiled backward on every layer.
 This includes norms (with the existing selective recomputation),
 attention and router scores/top-k. Global-batch load-balance
 collectives inside stage 1 are part of its graph. Expert routing decisions remain data-dependent.
@@ -36,13 +36,21 @@ This ownership is necessary because FSDP frees and reallocates unsharded paramet
 between steps. In particular, a forward may pass through `main_grad` while it has zero-byte storage;
 the graph does not read it until backward, after FSDP has allocated and zeroed it.
 
-Other model families and packed micro-batches are rejected when graphs are requested. Inference
+GPT-OSS captures its existing `forward_stage1_compute` and backward: input norm, full or sliding
+attention (including learnable sinks and projection biases), residual addition, and post-attention
+norm. Its router and load-balance operations remain outside capture, as does aggregation. Full and
+sliding attention specialize separately; graph counts depend on the compiled variants rather than
+a model-specific constant. GPT-OSS retains its existing CP=1 restriction.
+
+Model families other than Qwen3 MoE and GPT-OSS, and packed micro-batches, are rejected when graphs
+are requested. GPT-OSS-20B and GPT-OSS-120B share this implementation; testing one does not validate
+the other's memory, correctness, or throughput. Inference
 uses the ordinary compiled path. An instance captures only its first eligible shape/stride/scalar
 signature on one compute stream; subsequent mismatches, writable input aliases, and calls beyond
 the instance limit run normally. Capture errors are raised, rather than hiding a potentially
 partially executed collective behind fallback.
 Supported training keeps dense shapes and graph/fallback decisions consistent across ranks.
-Rank-asymmetric changes around captured collectives are unsupported. With context parallelism,
+Rank-asymmetric changes around captured collectives are unsupported. With Qwen context parallelism,
 the ring-attention communication inside stage 1 is captured as well; EP dispatch and pipeline
 communication remain outside it.
 
@@ -564,3 +572,138 @@ Blackwell, rank-asymmetric capture decisions, and unbounded training duration re
 this validation. Ruff lint/format checks and the focused import-layer checks pass. No kernel
 exports, architecture-selection rules, optimizer settings, routing policy, or recomputation
 policy changed in this follow-up.
+
+## GPT-OSS-20B follow-up
+
+The shared comparison driver accepts `--model gpt-oss-20b`, selecting the GPT-OSS configuration
+and GPT-OSS-tokenized DCLM corpus. Its Qwen defaults are unchanged. For the full 24-layer model,
+the bounded comparison uses one eight-H200 node, PP2/EP4/CP1, BF16, sequence 4096, MBS1/GBS64:
+
+```bash
+OMP_NUM_THREADS=8 torchrun --standalone --nproc-per-node=8 \
+    benchmarks/pretraining/qwen3-30b-a3b/cuda_graphs.py --model gpt-oss-20b \
+    --pp 2 --ep 4 --cp 1 --seq 4096 --mbs 1 --gbs 64 --tag gptoss-base0
+```
+
+Use distinct tags for the second graph-disabled baseline and the graph-enabled arm (`--graphs`).
+Correctness uses 32 real-routing steps and the loss-envelope method above. A matching timing pair
+adds `--performance` to both arms (12 force-balanced steps); compare synchronized max-rank medians
+after capture/tuning, and repeat whole runs before claiming a gain. No released checkpoint is
+needed. Verify at least 2048 corpus samples before launch.
+
+The small native reference uses the existing eight-layer/8192-vocabulary GPT-OSS fixture and
+sequence 256, so the 128-token sliding window has an effect. Run both `FP8=0` and `FP8=1`:
+
+```bash
+CUDA_GRAPHS=1 FP8=0 SEQUENCE_LENGTH=256 torchrun --standalone --nproc-per-node=4 \
+    tests/test_dualpipev.py --pp-size 2 --ep-size 2 --cp-size 1 \
+    --model examples/pretrain_lm/gpt-oss-20b/config.json
+```
+
+It compares complete outputs, losses and parameter gradients, reports attention sink/bias
+gradients without skipping small values, and checks the actual per-rank replay counts. Its two
+forward/backward steps and subsequent manual weight mutation check canonical export; they are
+not optimizer-step tests. `tests/test_gpt_oss_cuda_graphs.py` separately compares four SGD updates
+with changing inputs, full/sliding attention, sink/bias gradients and six live forward calls.
+The existing shared-backend tests cover aliases, mutable inputs, replaced weight storage and
+`main_grad`. Neither these small fixtures nor a full-model BF16 run establishes GPT-OSS-120B or
+full-model FP8 correctness/performance.
+
+Both four-H200 native checks pass at this fixture, without geometry changes beyond the test's
+existing eight-layer/8192-vocabulary reduction:
+
+| Precision | Largest output normalized difference | Largest parameter-gradient normalized difference | Graphs per rank | Forward / backward replays per rank |
+| --- | --- | --- | --- | --- |
+| BF16 | 0.00002228 | 0.000783 | 4 | 80 / 80 on all four ranks |
+| FP8 | 0.00055231 | 0.005321 | 4 | 40 / 40 on ranks 0–1; 120 / 120 on ranks 2–3 |
+
+FP8 uses GPT-OSS's existing edge-light layer placement; the unequal replay counts match the
+number of layers hosted on each rank. All captured attention sinks and projection biases are
+compared. The native test retains its existing noise-floor skip for tiny non-attention,
+non-expert gradients (including router bias and post-attention norm weights); the focused test
+skips no static-stage gradients.
+
+The full-model BF16 off/off/on comparison passes over all 32 real-routing steps:
+
+| Metric | Off/off mean absolute delta | Off/on mean absolute delta | Ratio |
+| --- | --- | --- | --- |
+| Cross-entropy | 0.00248125 | 0.00300625 | 1.212 |
+| Load balance | 0.00252109 | 0.00475275 | 1.885 |
+
+Both ratios are below the prescribed 3× threshold. An allocation change placed the first baseline
+on a different H200 node from the other two arms; source, environment, configuration and corpus
+identities match across all three arms. Every graph-enabled rank captures four graphs at step 2,
+retains four through step 32, and records 5952 forward plus 5952 backward replays: 192 of each per step after
+warmup. These runs use AdamW updates and fresh weights, unlike the native export tests.
+
+| Real-routing arm | Startup peak allocated / reserved GiB | Steps 6–32 peak allocated / reserved GiB | Minimum steady sampled physical free GiB |
+| --- | --- | --- | --- |
+| Off, first baseline | 66.472 / 102.127 | 66.887 / 83.732 | 50.755 |
+| Off, second baseline | 66.449 / 82.350 | 66.888 / 83.287 | 51.202 |
+| On | 68.336 / 83.932 | 68.775 / 87.232 | 47.257 |
+
+Values are maxima over all eight ranks; startup includes setup, tuning and steps 1–5. Physical
+free memory is sampled at synchronized boundaries, not at allocation peaks. End-of-step allocated
+bytes are constant on every rank over steps 6–32. Maximum per-rank reservation growth is
+4.725 / 3.305 / 3.301 GiB for the two baselines and graph arm, respectively. No allocation-failure
+or OOM messages were logged on any rank. These finite runs establish neither long-run convergence
+nor an allocator plateau.
+
+Two complete force-balanced timing pairs use the same full-model configuration, 12 steps per
+arm, on the same H200 node. Max-rank synchronized whole-step medians over steps 6–12 show a small
+repeatable **slowdown**, with no workload adjustment:
+
+| Pair | Off → on seconds | Off / on sample SD seconds | Step-time change | Throughput change |
+| --- | --- | --- | --- | --- |
+| 1 | 2.190692 → 2.247856 | 0.010671 / 0.006520 | +2.61% | −2.54% |
+| 2 | 2.176307 → 2.247366 | 0.015791 / 0.004644 | +3.27% | −3.16% |
+
+The generic comparison script's printed step times exclude only step 1; those are secondary
+measurements. The table uses synchronized whole steps after tuning/capture. Each graph-enabled
+timing run ends with four graphs and 2112 forward/2112 backward replays on every rank.
+
+| Timing memory, ranges across the two pairs | Off allocated / reserved GiB | On allocated / reserved GiB | Off → on minimum sampled physical free GiB |
+| --- | --- | --- | --- |
+| Startup | 65.939 / 77.180 | 67.817 / 79.512–80.023 | 57.310 → 54.466–54.978 |
+| Steps 6–12 | 65.929 / 77.180 | 67.806–67.808 / 79.512–80.023 | 57.310 → 54.466–54.978 |
+
+End-of-step allocated and reserved bytes are flat on every rank throughout both timing windows;
+there are no logged allocation failures. Setup takes 27.50–28.67 s, first-step compilation/warmup
+60.19–71.24 s, and summed tuning calls 26.49–26.73 s across these four runs. Maximum summed
+graph-capture time per rank is 0.0353 / 0.0362 s in the two graph arms; their complete step 2 takes
+2.565 / 2.962 s. These startup observations use existing caches and do not establish a cold-start
+benefit. This coverage is GPT-OSS-20B on H200 with PyTorch 2.13.0+cu130, FA4 4.0.0b28 and
+QuACK 0.6.5; it does not establish a benefit for GPT-OSS or results for the untested configurations
+listed above. Graphs remain opt-in.
+
+## DeepSeek V2-Lite portability assessment
+
+DeepSeek remains rejected by the setup allowlist. Source inspection has not established a
+fundamental capture failure for dense CP1 training; it does not establish runtime safety either.
+Its existing `forward_stage1_compute` is a candidate for the same explicit decorator integration.
+No pipeline schedule change or model registry is needed.
+
+| Source and entry | Concrete difference and required check |
+| --- | --- |
+| `models/deepseek_v2.py`, `DeepSeekV2DecoderLayer.forward_stage1_compute` | The first layer is dense (`first_k_dense_replace=1`); it returns before shared experts and routing. Later MoE layers compute shared experts and router results inside stage 1. Warm and count both static variants. The dense MLP and routed experts stay in stage 3. |
+| `models/deepseek_v2.py`, `DeepSeekV2DecoderLayer.forward_stage5` | The existing comment records that merging aggregation with the next stage 1 changes forward bits. Retain this separate boundary. |
+| `models/deepseek_v2.py`, `DeepSeekV2Attention.forward` | CP1 decompresses MLA K/V before FA4. CP>1 calls the separate MLA ring, passing `kv_b_proj.weight` directly and optional quantized operands. Qwen's ring validation does not cover this path. |
+| `operators/fp8_swiglu_mlp.py`, `fp8_swiglu_mlp` and its backward | Shared experts add saved gate/up activations and transposed FP8 operands to capture. The fused path requires a multiple of 128 rows. Check all shared-projection gradients, current weights and saved-activation lifetimes for several outstanding micro-batches. |
+| `operators/ring_attention.py`, `mla_zigzag_ring_fwd`, `mla_zigzag_ring_bwd` | Shape/rank-controlled loops issue batched P2P operations and wait for completion. No tensor-value extraction was found in these paths. Native capture must still verify collective ordering, buffer reuse and warmup of every FA4 signature. |
+| `operators/ring_attention.py`, `mla_zigzag_ring_setup_context` | Backward holds four nondifferentiable FP8 operands on its context, alongside saved BF16 tensors. Check that AOT exposes the operands needed for replay and that updates refresh them. Nondifferentiability does not prove safe storage lifetime. |
+| `modules/wgrad_accumulation.py`, `_attach_main_grads` | MLA ring backward recomputes decompression and returns a direct FP32 `kv_b` weight gradient. FSDP merges it with `main_grad` before freeing storage. Check gradient magnitude as well as direction to detect missing accumulation or CP reduction. |
+
+The setup allowlist and ordinary stage-1 decorator are current integration gaps. Packed input is
+an existing hard restriction of graph-enabled DualPipeV; DeepSeek additionally rejects packed
+CP>1 because its MLA ring has no document boundaries. Shared-expert capture, MLA ring capture,
+FP8 backward lifetimes, scratch memory, and throughput are **untested risks**, not demonstrated
+failures. They are not covered by GPT-OSS results.
+
+The smallest next validation is one actual-geometry dense layer and one MoE layer at CP1,
+sequence 256/MBS1, first BF16 then FP8. Compare ordinary and captured outputs, input gradients and
+all shared-expert gradients over live micro-batches and replaced/updated weights, with bounded
+graph counts. Then use the eight-layer PP2/EP2/CP1 native fixture for FSDP storage lifetimes.
+Before enabling CP, add a separate two-GPU CP2 MLA replay check at sequence 512/MBS1 (256 local
+tokens and 128-token half-blocks), using the unsharded dense and FP8 references in
+`tests/operators/test_ring_attention.py`. No DeepSeek model CUDA-graph run or performance claim accompanies
+this assessment.

@@ -21,6 +21,9 @@ from pithtrain.tasks import pretrain_lm
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model", choices=("qwen3-30b-a3b", "gpt-oss-20b"), default="qwen3-30b-a3b"
+    )
     parser.add_argument("--pp", type=int, default=1)
     parser.add_argument("--ep", type=int, default=8)
     parser.add_argument("--cp", type=int, default=1)
@@ -32,20 +35,19 @@ def main():
     parser.add_argument("--graphs", action="store_true")
     parser.add_argument("--performance", action="store_true")
     parser.add_argument("--tag", required=True)
-    parser.add_argument(
-        "--dataset", type=Path, default=Path("workspace/datasets/dclm-baseline/toktxt/qwen3")
-    )
+    parser.add_argument("--dataset", type=Path)
     parser.add_argument("--output", type=Path, default=Path("workspace/cuda-graphs/evidence"))
     args = parser.parse_args()
 
     cfg = pretrain_lm.PretrainLMCfg()
-    cfg.dataset = args.dataset
+    tokenizer = "gpt-oss" if args.model == "gpt-oss-20b" else "qwen3"
+    cfg.dataset = args.dataset or Path("workspace/datasets/dclm-baseline/toktxt") / tokenizer
     mesh = cfg.distributed
     mesh.pipeline_parallel_size = args.pp
     mesh.expert_parallel_size = args.ep
     mesh.context_parallel_size = args.cp
     training = cfg.training
-    training.model = Path("examples/pretrain_lm/qwen3-30b-a3b")
+    training.model = Path("examples/pretrain_lm") / args.model
     training.optimizer = make_adamw_optimizer
     training.moe_load_balance_type, training.moe_load_balance_coef = "global-batch", 1e-3
     training.micro_batch_size, training.global_batch_size = args.mbs, args.gbs
