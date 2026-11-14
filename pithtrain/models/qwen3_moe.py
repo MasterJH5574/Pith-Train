@@ -316,8 +316,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
         With CUDA graphs, capture only stage 1 to avoid copying the larger expert-output buffers.
         """
         replay_idx = replay_indices(self.mlp.gate, residual, self.mlp.num_experts_per_tok)
+        from pithtrain.pipeline.cuda_graphs import check_scheduled_layer
         from pithtrain.pipeline.graph_buffers import is_combine_buffer
 
+        check_scheduled_layer(prev_layer)
+        check_scheduled_layer(self)
         if training.cuda_graphs and torch.is_grad_enabled() and not is_combine_buffer(moe_outs):
             # Preserve the fused path's FSDP scheduling. Bypass the previous layer's registered
             # forward_stage5 wrapper: aggregation reads no parameters.

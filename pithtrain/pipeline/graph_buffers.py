@@ -104,9 +104,12 @@ def scheduled_graph_buffers(pool):
         raise RuntimeError("CUDA graph buffer step must start with a drained pipeline")
     active_pool = pool
     try:
-        yield
-        if pool.live:
-            raise RuntimeError("CUDA graph buffer step ended with unconsumed combine leases")
+        with torch.autograd.graph.disable_saved_tensors_hooks(
+            "scheduler-owned combine buffers cannot escape through saved-tensor hooks"
+        ):
+            yield
+            if pool.live:
+                raise RuntimeError("CUDA graph buffer step ended with unconsumed combine leases")
     finally:
         active_pool = None
 

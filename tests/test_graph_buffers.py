@@ -161,3 +161,103 @@ def test_combine_spare_precedes_recent_retirement_and_reuse_is_fifo():
         pool.release(reused)
         pool.release(spare)
     assert pool.live == 0 and len(pool.slots) == 3
+
+
+def test_scheduled_step_rejects_late_saved_tensor_hooks():
+    from pithtrain.pipeline.graph_buffers import CombineBufferPool, scheduled_graph_buffers
+
+    with scheduled_graph_buffers(CombineBufferPool(1)):
+        with pytest.raises(RuntimeError, match="scheduler-owned combine buffers"):
+            with torch.autograd.graph.saved_tensors_hooks(lambda x: x, lambda x: x):
+                raise AssertionError("observer should be rejected before installation")
+
+
+def test_scheduled_stage_rejects_late_method_replacement(monkeypatch):
+    from pithtrain.contexts import distributed
+    from pithtrain.pipeline import cuda_graphs as cg
+    from pithtrain.pipeline.graph_buffers import CombineBufferPool, scheduled_graph_buffers
+
+    monkeypatch.setattr(distributed, "ep_size", 2, raising=False)
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = torch.nn.Identity()
+            cg.declare_pipeline_outputs(self, Layer, ("norm",), ("compute",))
+
+        def compute(self, x):
+            return self.norm(x)
+
+    layer = Layer()
+    called = []
+    original = layer.compute
+    with scheduled_graph_buffers(CombineBufferPool(1)):
+        cg.check_scheduled_layer(layer)
+        layer.compute = lambda x: called.append(x)
+        with pytest.raises(RuntimeError, match="stage mutation"):
+            cg.pipeline_call(layer, layer.compute, torch.ones(4, device="cuda"))
+        layer.compute = original
+        layer.norm.router_replay = lambda tokens, topk: called.append(tokens)
+        with pytest.raises(RuntimeError, match="routing callbacks"):
+            cg.pipeline_call(layer, layer.compute, torch.ones(4, device="cuda"))
+    assert not called
+
+
+def test_only_registered_force_balance_callbacks_are_observer_free():
+    from pithtrain.contexts.router_replay import is_observer_free_replay
+    from pithtrain.modules.load_balance import force_balance
+
+    callback = force_balance(8)
+    assert is_observer_free_replay(callback)
+    assert not is_observer_free_replay(lambda tokens, topk: callback(tokens, topk))
+    assert not is_observer_free_replay(None)
+
+
+def test_nonowning_outputs_preserve_aliases_with_delayed_auxiliary_stream():
+    from pithtrain.pipeline.cuda_graphs import nonowning_graph_outputs
+
+    pool = torch.cuda.graph_pool_handle()
+    stream, auxiliary = torch.cuda.Stream(), torch.cuda.Stream()
+    first = torch.full((8, 16), 2.0, device="cuda")
+    second = torch.full_like(first, 5.0)
+    torch.cuda.synchronize()
+
+    def capture(value):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool, stream=stream):
+            intermediate = value * 2
+            auxiliary.wait_stream(stream)
+            with torch.cuda.stream(auxiliary):
+                torch.cuda._sleep(1_000_000)
+                result = intermediate + 3
+            stream.wait_stream(auxiliary)
+        outputs, released = nonowning_graph_outputs(
+            [result, result, result[:, 1::2], value], [value], graph, pool
+        )
+        assert released == result.untyped_storage().nbytes()
+        assert outputs[0] is outputs[1]
+        assert outputs[3] is value  # Input storage must retain its original owner.
+        assert outputs[2].stride() == result[:, 1::2].stride()
+        assert outputs[2].storage_offset() == 1
+        return graph, outputs
+
+    g0, y0 = capture(first)
+    g1, y1 = capture(second)
+    assert y0[0].data_ptr() == y1[0].data_ptr()
+    with torch.cuda.stream(stream):
+        g0.replay()
+        saved0 = [x.clone() for x in y0]
+        g1.replay()
+        saved1 = [x.clone() for x in y1]
+        g0.replay()
+        saved_again = y0[0].clone()
+    stream.synchronize()  # No host synchronization between replay and the next variant.
+    g0.reset()
+    g1.reset()
+    pressure = torch.empty(1024 * 1024, device="cuda").fill_(99)
+    for outputs, expected, source in [(saved0, 7, first), (saved1, 13, second)]:
+        for tensor in outputs[:3]:
+            torch.testing.assert_close(tensor, torch.full_like(tensor, expected))
+        torch.testing.assert_close(outputs[3], source)
+    torch.testing.assert_close(saved_again, torch.full_like(saved_again, 7))
+    del pressure

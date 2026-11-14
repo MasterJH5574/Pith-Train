@@ -6,6 +6,8 @@ import torch.distributed
 import torch.distributed._functional_collectives as funcol
 from torch.utils.checkpoint import checkpoint, create_selective_checkpoint_contexts
 
+from pithtrain.contexts.router_replay import register_observer_free_replay
+
 __all__ = [
     "GlobalBatchLoadBalanceLoss",
     "MicroBatchLoadBalanceLoss",
@@ -283,7 +285,7 @@ def force_balance(num_experts: int) -> Callable[[int, int], torch.Tensor]:
             indices = cache[(num_tokens, top_k)] = (token + slot * stride) % num_experts
         return indices
 
-    return replay
+    return register_observer_free_replay(replay)
 
 
 def replay_indices(

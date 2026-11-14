@@ -19,6 +19,7 @@ from torch.distributed.tensor import DTensor
 from torch.utils._device import DeviceContext
 
 from pithtrain.contexts import distributed, training
+from pithtrain.contexts.router_replay import is_observer_free_replay
 from pithtrain.operators.graph_copy import GraphCopy
 from pithtrain.pipeline import graph_buffers
 
@@ -138,7 +139,23 @@ def pipeline_outputs_allowed(module, *, scheduled=False):
             # FSDP's hooks on the layer's __call__ are not invoked by its stage methods.
             if child is not module
         )
+    if allowed and scheduled:
+        allowed = all(
+            getattr(child, "router_replay", None) is None
+            or is_observer_free_replay(child.router_replay)
+            for child in contract["modules"]
+        )
     return allowed
+
+
+def check_scheduled_layer(module):
+    """Reject late observers before executing a stage that may consume pooled inputs."""
+    if graph_buffers.active_pool is not None and not pipeline_outputs_allowed(
+        module, scheduled=True
+    ):
+        raise RuntimeError(
+            "scheduler-owned combine buffers do not support observers, routing callbacks or stage mutation during a step"
+        )
 
 
 def pipeline_call(module, method, *args):
@@ -149,6 +166,7 @@ def pipeline_call(module, method, *args):
     The compiled entry rechecks observers after any router-replay callback has run.
     """
     global active_pipeline_layer
+    check_scheduled_layer(module)
     if not pipeline_output_leases:
         return method(*args)
     previous = active_pipeline_layer
@@ -1635,7 +1653,7 @@ def graph_backend(gm, example_inputs, *, options, pipeline_outputs=()):
     # compiler builds the callable, restoring the guard before any runtime saved tensors escape.
     disabled = (
         torch._C._autograd._saved_tensors_hooks_get_disabled_error_message()
-        if active_borrow
+        if active_borrow or graph_buffers.active_pool is not None
         else None
     )
     if disabled is not None:

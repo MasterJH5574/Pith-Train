@@ -32,6 +32,7 @@ from pithtrain.contexts.weight_grad_store import WeightGradStore
 from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
 from pithtrain.operators.all_to_all import all_to_all_async, direct_all_to_all
 from pithtrain.pipeline.cuda_graphs import (
+    check_scheduled_layer,
     pipeline_call,
     private_producer_allowed,
     private_stage_input,
@@ -74,6 +75,8 @@ __all__ = [
 def run_backward(
     tensors: List[torch.Tensor], grad_tensors: List[torch.Tensor], graph_owner=None
 ) -> None:
+    if graph_owner is not None:
+        check_scheduled_layer(graph_owner)
     pairs = [(tensor, grad) for tensor, grad in zip(tensors, grad_tensors) if tensor is not None]
     if not pairs:
         return
@@ -362,6 +365,7 @@ class Stage5Record:
 
 def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[RoutingInfo], residual: torch.Tensor):  # fmt: skip
     nvtx.range_push("layer%02d.stage5_f" % layer.idx)
+    check_scheduled_layer(layer)
     record = Stage5Record()
 
     moe_outs = detach_combine_buffer(moe_outs)
@@ -375,6 +379,7 @@ def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, ro
     drain_deferred_free(ctx)
 
     moe_local_idxs = routing.moe_local_idxs if routing is not None else None
+    check_scheduled_layer(layer)
     hidden_states = layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
     record.outs = Stage5Outs(hidden_states)
 
@@ -384,6 +389,7 @@ def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, ro
 
 def stage5_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage5Record, grad_tensors: tuple):
     nvtx.range_push("layer%02d.stage5_b" % layer.idx)
+    check_scheduled_layer(layer)
 
     run_backward(record.outs, grad_tensors)
     release_combine_buffer(record.args.moe_outs)
@@ -398,6 +404,8 @@ def stage5_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage5Record, grad
 
 def stage5_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[RoutingInfo], residual: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None):  # fmt: skip
     nvtx.range_push("layer%02d_stage5_f_layer%02d_stage1_f" % (prev_layer.idx, next_layer.idx))
+    check_scheduled_layer(prev_layer)
+    check_scheduled_layer(next_layer)
 
     moe_outs = detach_combine_buffer(moe_outs)
     topk_weight = routing.topk_weight if routing is not None else None
@@ -639,6 +647,7 @@ def layer_forward(
     if has_experts and fwd_comm_work is not None:
         layer_record.stage3.outs.moe_outs.untyped_storage().resize_(0)
     moe_local_idxs = routing.moe_local_idxs if has_experts else None
+    check_scheduled_layer(layer)
     hidden_states = layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
 
     record.outs = Stage5Outs(hidden_states)
@@ -658,6 +667,7 @@ def layer_backward(
     that layer's stage5.args and returns None. A stage 5 fused that way (stage5.outs None) reads
     its gradients from its own stage5.args, which the next layer already filled.
     """
+    check_scheduled_layer(layer)
     stage1_record = layer_record.stage1
     stage5_record = layer_record.stage5
     stage5_was_merged = stage5_record.args is not None and stage5_record.outs is None
