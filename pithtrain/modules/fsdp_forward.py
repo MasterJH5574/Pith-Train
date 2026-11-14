@@ -225,7 +225,13 @@ def register_fsdp_forward_method(module: nn.Module, method_name: str) -> None:
         state._training_state = TrainingState.IDLE
         return out
 
-    setattr(module, method_name, wrapped_method.__get__(module, type(module)))
+    wrapped = wrapped_method.__get__(module, type(module))
+    setattr(module, method_name, wrapped)
+    contract = getattr(module, "cuda_graph_output_contract", None)
+    if contract is not None and contract["methods"].get(method_name) == orig_method:
+        # Only this known FSDP wrapper inherits the constructor's output-lifetime contract.
+        # A custom replacement retains the ordinary escaping-output path.
+        contract["methods"][method_name] = wrapped
 
 
 # The FSDP hooks, decorated with _dynamo_disable, that run during a training step.

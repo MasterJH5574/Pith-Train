@@ -33,7 +33,12 @@ from pithtrain.operators.token_scatter import (
     precompute_group_indices,
     scatter_for_grouped_gemm,
 )
-from pithtrain.pipeline.cuda_graphs import compile_stage
+from pithtrain.pipeline.cuda_graphs import (
+    compile_stage,
+    declare_pipeline_outputs,
+    private_producer_allowed,
+    private_stage_input,
+)
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
@@ -239,8 +244,24 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.mlp = Qwen3MoeMoE(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        declare_pipeline_outputs(
+            self,
+            Qwen3MoeDecoderLayer,
+            ("input_layernorm", "self_attn", "post_attention_layernorm", "mlp.gate"),
+            (
+                "forward_stage5",
+                "stage5_compute",
+                "forward_stage1",
+                "forward_stage1_compute",
+                "stage1_compute",
+                "stage1_dispatch",
+                "forward_stage5_stage1",
+                "forward_stage5_stage1_compute",
+            ),
+            producer_methods=("forward_stage5", "stage5_compute"),
+        )
 
-    @compile_stage(options={"cpp_wrapper": True, **stage_compile_options()})
+    @compile_stage(options={"cpp_wrapper": True, **stage_compile_options()}, pipeline_outputs=(0,))
     def forward_stage1_compute(
         self,
         hidden_states: torch.Tensor,
@@ -296,8 +317,18 @@ class Qwen3MoeDecoderLayer(nn.Module):
         if training.cuda_graphs and torch.is_grad_enabled():
             # Preserve the fused path's FSDP scheduling. Bypass the previous layer's registered
             # forward_stage5 wrapper: aggregation reads no parameters.
+            private = private_producer_allowed(prev_layer, self)
             hidden_states = Qwen3MoeDecoderLayer.forward_stage5(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual)  # fmt: skip
-            outs = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens, replay_idx)
+            with private_stage_input(
+                self,
+                hidden_states,
+                prev_layer,
+                (moe_outs, moe_local_idxs, topk_weight, residual),
+                allowed=private,
+            ):
+                outs = self.forward_stage1_compute(
+                    hidden_states, rotary_posemb, cu_seqlens, replay_idx
+                )
         else:
             outs = self.forward_stage5_stage1_compute(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
         return self.stage1_dispatch(*outs)

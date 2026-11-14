@@ -27,10 +27,15 @@ import torch.cuda.nvtx as nvtx
 import torch.distributed
 from torch.autograd import Variable
 
-from pithtrain.contexts import distributed
+from pithtrain.contexts import distributed, training
 from pithtrain.contexts.weight_grad_store import WeightGradStore
 from pithtrain.models.interface import AllToAllSplits, LayerProtocol, ModelProtocol, RoutingInfo
 from pithtrain.operators.all_to_all import all_to_all_async, direct_all_to_all
+from pithtrain.pipeline.cuda_graphs import (
+    pipeline_call,
+    private_producer_allowed,
+    private_stage_input,
+)
 
 __all__ = [
     "ChunkRecord",
@@ -61,7 +66,9 @@ __all__ = [
 ]
 
 
-def run_backward(tensors: List[torch.Tensor], grad_tensors: List[torch.Tensor]) -> None:
+def run_backward(
+    tensors: List[torch.Tensor], grad_tensors: List[torch.Tensor], graph_owner=None
+) -> None:
     pairs = [(tensor, grad) for tensor, grad in zip(tensors, grad_tensors) if tensor is not None]
     if not pairs:
         return
@@ -73,7 +80,13 @@ def run_backward(tensors: List[torch.Tensor], grad_tensors: List[torch.Tensor]) 
         accumulate_grad=True,
     )
     with torch.autograd.set_multithreading_enabled(False):
-        Variable._execution_engine.run_backward(tensors, grad_tensors, **kwargs)
+        if graph_owner is not None and training.cuda_graphs:
+            from pithtrain.pipeline.cuda_graphs import graph_stage
+
+            with graph_stage(graph_owner, backward=True):
+                Variable._execution_engine.run_backward(tensors, grad_tensors, **kwargs)
+        else:
+            Variable._execution_engine.run_backward(tensors, grad_tensors, **kwargs)
 
 
 @dataclass(slots=True)
@@ -143,7 +156,7 @@ def stage1_f(ctx: ExecutionCtx, layer: LayerProtocol, hidden_states: torch.Tenso
     next_hidden_states = hidden_states.detach().requires_grad_()
     record.args = Stage1Args(prev_hidden_states, next_hidden_states)
 
-    dispatch_tokens, residual, routing = layer.forward_stage1(next_hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
+    dispatch_tokens, residual, routing = pipeline_call(layer, layer.forward_stage1, next_hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
     ctx.comp_stream.record_event(ctx.fwd_event)
 
     topk_weight = routing.topk_weight if routing is not None else None
@@ -159,7 +172,7 @@ def stage1_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage1Record, grad
     if ctx.bwd_comm_work is not None:
         ctx.bwd_comm_work.wait()
 
-    run_backward(record.outs, grad_tensors)
+    run_backward(record.outs, grad_tensors, graph_owner=layer)
 
     hidden_states_grad = record.args.next_hidden_states.grad
     record.args.prev_hidden_states.grad = hidden_states_grad
@@ -388,10 +401,21 @@ def stage5_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: La
     moe_local_idxs = routing.moe_local_idxs if routing is not None else None
     fused = getattr(next_layer, "forward_stage5_stage1", None)
     if fused is not None:
-        dispatch_tokens, next_residual, next_routing = fused(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, rotary_posemb, cu_seqlens)  # fmt: skip
+        dispatch_tokens, next_residual, next_routing = pipeline_call(next_layer, fused, prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, rotary_posemb, cu_seqlens)  # fmt: skip
     else:
+        private = training.cuda_graphs and private_producer_allowed(prev_layer, next_layer)
         hidden_states = prev_layer.forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
-        dispatch_tokens, next_residual, next_routing = next_layer.forward_stage1(hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
+        if private:
+            with private_stage_input(
+                next_layer,
+                hidden_states,
+                prev_layer,
+                (moe_outs, moe_local_idxs, topk_weight, residual),
+                allowed=private,
+            ):
+                dispatch_tokens, next_residual, next_routing = pipeline_call(next_layer, next_layer.forward_stage1, hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
+        else:
+            dispatch_tokens, next_residual, next_routing = pipeline_call(next_layer, next_layer.forward_stage1, hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
     ctx.comp_stream.record_event(ctx.fwd_event)
 
     next_topk_weight = next_routing.topk_weight if next_routing is not None else None
@@ -407,7 +431,7 @@ def stage1_stage5_b(ctx: ExecutionCtx, next_layer: LayerProtocol, prev_layer: La
     if ctx.bwd_comm_work is not None:
         ctx.bwd_comm_work.wait()
 
-    run_backward(stage1_outs, grad_tensors)
+    run_backward(stage1_outs, grad_tensors, graph_owner=next_layer)
 
     ctx.comp_stream.record_event(ctx.bwd_event)
 
@@ -530,7 +554,7 @@ def layer_forward(
     next_hidden_states = hidden_states.detach().requires_grad_()
     record.args = Stage1Args(prev_hidden_states, next_hidden_states)
 
-    dispatch_tokens, residual, routing = layer.forward_stage1(next_hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
+    dispatch_tokens, residual, routing = pipeline_call(layer, layer.forward_stage1, next_hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
 
     has_experts = routing is not None
 
@@ -659,7 +683,11 @@ def layer_backward(
     if bwd_comm_work is not None:
         bwd_comm_work.wait()
 
-    run_backward(stage1_record.outs, (dispatch_tokens_grad, residual_grad, topk_weight_grad))
+    run_backward(
+        stage1_record.outs,
+        (dispatch_tokens_grad, residual_grad, topk_weight_grad),
+        graph_owner=layer,
+    )
     if stage1_is_merged:
         input_grads = None
     else:

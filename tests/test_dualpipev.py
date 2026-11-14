@@ -8,6 +8,7 @@ from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Tuple
+from unittest.mock import patch
 
 import torch
 import torch.distributed.fsdp
@@ -199,6 +200,8 @@ def canonical_state_dict(model: nn.Module, ep_rank: int) -> dict:
 
 
 def apply_fsdp(model, dtype):
+    from pithtrain.modules.fsdp_forward import register_fsdp_forward_method
+
     # Mirrors modules.training.apply_fsdp: expert parameters shard over the dp axis of the expert
     # view, attention parameters over the flattened dp x cp stage of the attention view.
     expt_fsdp_mesh = distributed.expt_mesh["dp"]
@@ -238,13 +241,11 @@ def apply_fsdp(model, dtype):
                     mp_policy=mp_policy,
                 )
                 if hasattr(layer.mlp.experts, "forward_from_tokens"):
-                    torch.distributed.fsdp.register_fsdp_forward_method(
-                        layer.mlp.experts, "forward_from_tokens"
-                    )
+                    register_fsdp_forward_method(layer.mlp.experts, "forward_from_tokens")
             fully_shard(layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp_policy)  # fmt: skip
-            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage1")
-            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage3")
-            torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage5")
+            register_fsdp_forward_method(layer, "forward_stage1")
+            register_fsdp_forward_method(layer, "forward_stage3")
+            register_fsdp_forward_method(layer, "forward_stage5")
         fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp_policy)
     # Plain-sum reduction, as in modules.training.apply_fsdp.
     for module in model.modules():
@@ -464,6 +465,7 @@ def main(model_name: str):
             output_diffs.append(diff)
         return objective(model_outputs, objective_inputs)
 
+    merged_stage_calls = []
     for step_index, chunks in enumerate(chunk_steps):
         output_diffs = []
         # Every pipeline rank builds the same micro-batches, so each derives its own P2P shapes;
@@ -491,7 +493,13 @@ def main(model_name: str):
         with torch.no_grad():
             collected_outputs = dualpipev_model.step(microbatches, collect)
         assert records_empty(dualpipev_model), "a forward-only step kept activations"
-        objective_outputs = dualpipev_model.step(microbatches, checked_objective)
+        # Warmup/cooldown execute whole layers; only the overlapped loop merges this edge.
+        # Count the executed scheduler entry instead of inferring it from model adjacency.
+        from pithtrain.pipeline import dualpipev as scheduler
+
+        with patch.object(scheduler, "stage5_stage1_f", wraps=scheduler.stage5_stage1_f) as merged:
+            objective_outputs = dualpipev_model.step(microbatches, checked_objective)
+            merged_stage_calls.append(merged.call_count)
         assert records_empty(dualpipev_model), "a training step kept activations"
         if check_graph_outputs and pp_rank == 0:
             assert len(output_diffs) == num_chunks
@@ -635,7 +643,27 @@ def main(model_name: str):
             assert stats["forward_replays"] == stats["backward_replays"] == expected_replays, stats
         else:
             assert stats["forward_replays"] > 0 and stats["backward_replays"] > 0, stats
-        assert 0 < stats["instances"] <= MAX_GRAPHS, stats
+        bound = (
+            MAX_GRAPHS * max(1, stats.get("owners", 0)) * (stats.get("max_leases_per_owner", 0) + 1)
+        )
+        assert 0 < stats["instances"] <= bound, stats
+        assert stats.get("live_saved_storages", 0) == 0, stats
+        if (
+            not ragged
+            and not training.fp8
+            and cp_size == 1
+            and ep_size > 1
+            and config.model_type in ("gpt_oss", "qwen3_moe")
+        ):
+            assert stats["pipeline_output_replays"] == stats["forward_replays"], stats
+            assert stats["pipeline_output_slots"] == stats["forward_slots"], stats
+            assert len(merged_stage_calls) == 2 and merged_stage_calls[0] == merged_stage_calls[1]
+            assert stats["retained_input_replays"] == merged_stage_calls[1], stats
+            assert bool(stats["retained_input_slots"]) == bool(merged_stage_calls[1]), stats
+            print(
+                f"[INFO] rank-{distributed.rank}, merged stage calls: {merged_stage_calls}",
+                flush=True,
+            )
         print(f"[INFO] rank-{distributed.rank}, CUDA graphs: {stats}", flush=True)
     torch.distributed.barrier()
 

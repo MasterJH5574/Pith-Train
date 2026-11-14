@@ -34,6 +34,8 @@ from pithtrain.kernels.compile_options import stage_compile_options
 from pithtrain.kernels.token_scatter import scatter_by_expert
 from pithtrain.kernels.tuning import tune_kernels
 
+from pithtrain.kernels.graph_copy import graph_copy
+
 __all__ = []
 
 # FP8 dense GEMMs and activation quantization
@@ -135,3 +137,6 @@ __all__.append("tune_kernels")
 
 # Inductor options of the models' compiled stages
 __all__.append("stage_compile_options")
+
+# CUDA graph transfers
+__all__.append("graph_copy")

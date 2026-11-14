@@ -539,6 +539,22 @@ class DualPipeV(nn.Module):
         )
         # A step whose signature already ran with full Dynamo guards skips evaluating them; see
         # guard_skip for why that is safe.
+        if (
+            training.cuda_graphs
+            and not training.fp8
+            and distributed.cp_size == 1
+            and torch.is_grad_enabled()
+        ):
+            from pithtrain.pipeline.cuda_graphs import graph_step
+
+            with graph_step(
+                (layer for module in self.module for layer in module.layers.values()),
+                max_leases=2 * distributed.pp_size,
+                executor_outputs=True,
+            ):
+                return self.guard_skip.run(
+                    self, microbatches, self.run_step, microbatches, objective
+                )
         return self.guard_skip.run(self, microbatches, self.run_step, microbatches, objective)
 
     def run_step(self, microbatches: List[Microbatch], objective: Optional[Callable]) -> List[Any]:

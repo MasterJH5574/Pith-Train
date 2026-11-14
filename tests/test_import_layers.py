@@ -69,7 +69,7 @@ SM90_CROSS_EDGES = {
 }
 # What models/ may import from modules/ (from kernels/ only the package, like everyone else).
 MODELS_MODULES = {"load_balance", "recompute", "fp8_param_gather"}
-PIPELINE_OPERATORS = {"all_to_all"}
+PIPELINE_OPERATORS = {"all_to_all", "graph_copy"}
 
 # Known violations, as (rule, module, detail). The test also fails on an entry that no longer
 # occurs, so the list stays exact.

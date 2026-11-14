@@ -81,14 +81,22 @@ def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch
     """
     orig_pre_backward, orig_post_backward = group.pre_backward, group.post_backward
 
+    zeroed = False
+
     def pre_backward(*args: Any) -> None:
-        for _, main_grad in pairs:
-            if main_grad.untyped_storage().size() == 0:
-                main_grad.untyped_storage().resize_(main_grad.numel() * main_grad.element_size())
+        nonlocal zeroed
+        if not zeroed:
+            for _, main_grad in pairs:
+                if main_grad.untyped_storage().size() == 0:
+                    main_grad.untyped_storage().resize_(
+                        main_grad.numel() * main_grad.element_size()
+                    )
                 main_grad.zero_()
+            zeroed = True
         orig_pre_backward(*args)
 
     def post_backward(*args: Any) -> None:
+        nonlocal zeroed
         if not group.reduce_grads:
             orig_post_backward(*args)
             return
@@ -99,7 +107,9 @@ def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch
                 fsdp_param.to_accumulated_grad_if_needed()
         # Keep any gradient the weight got outside its layer, e.g. kv_b_proj in MLA ring attention.
         for fsdp_param, main_grad in pairs:
-            if main_grad.untyped_storage().size() > 0:
+            # A forward-only step also reaches post_backward, but must not reduce a retained
+            # accumulator from the preceding training step a second time.
+            if zeroed and main_grad.untyped_storage().size() > 0:
                 if fsdp_param.unsharded_accumulated_grad is not None:
                     main_grad.add_(fsdp_param.unsharded_accumulated_grad)
                 # A transposed main_grad is made contiguous once per step for the reduce-scatter.
@@ -107,7 +117,9 @@ def _attach_main_grads(group: FSDPParamGroup, pairs: List[Tuple[FSDPParam, torch
         orig_post_backward(*args)
         # FSDP2 has copied main_grad into the reduce-scatter input on this stream.
         for _, main_grad in pairs:
-            main_grad.untyped_storage().resize_(0)
+            if not getattr(main_grad, "cuda_graph_retain", False):
+                main_grad.untyped_storage().resize_(0)
+        zeroed = False
 
     group.pre_backward = pre_backward
     group.post_backward = post_backward

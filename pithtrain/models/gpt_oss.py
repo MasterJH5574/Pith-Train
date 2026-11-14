@@ -37,7 +37,11 @@ from pithtrain.operators.token_scatter import (
     precompute_group_indices,
     scatter_for_grouped_gemm,
 )
-from pithtrain.pipeline.cuda_graphs import compile_stage
+from pithtrain.pipeline.cuda_graphs import (
+    compile_stage,
+    declare_pipeline_outputs,
+    private_input_after_callback,
+)
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
@@ -377,13 +381,21 @@ class GptOssDecoderLayer(nn.Module):
         self.mlp = GptOssMoE(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        declare_pipeline_outputs(
+            self,
+            GptOssDecoderLayer,
+            ("input_layernorm", "self_attn", "post_attention_layernorm", "mlp.router"),
+            ("forward_stage1", "forward_stage1_compute", "forward_stage5"),
+            producer_methods=("forward_stage5",),
+        )
 
-    @compile_stage(options={"cpp_wrapper": True, **stage_compile_options()})
+    @compile_stage(options={"cpp_wrapper": True, **stage_compile_options()}, pipeline_outputs=(0,))
     def forward_stage1_compute(
         self,
         hidden_states: torch.Tensor,
         rotary_posemb: tuple[torch.Tensor, torch.Tensor],
         cu_seqlens: torch.Tensor | None = None,
+        replay_idx: torch.Tensor | None = None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -391,7 +403,8 @@ class GptOssDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        return hidden_states, residual
+        topk_idx, topk_weight, lb_loss = self.mlp.router(hidden_states, replay_idx)
+        return hidden_states, residual, topk_idx, topk_weight, lb_loss
 
     def forward_stage1(
         self,
@@ -399,9 +412,9 @@ class GptOssDecoderLayer(nn.Module):
         rotary_posemb: tuple[torch.Tensor, torch.Tensor],
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
-        hidden_states, residual = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
         replay_idx = replay_indices(self.mlp.router, hidden_states, self.mlp.num_experts_per_tok)
-        topk_idx, topk_weight, lb_loss = self.mlp.router(hidden_states, replay_idx)
+        private_input_after_callback(self)
+        hidden_states, residual, topk_idx, topk_weight, lb_loss = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
         dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.num_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)  # fmt: skip

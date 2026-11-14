@@ -21,26 +21,117 @@ the device and must not run in the middle of the overlapped schedule. Capture re
 without an extra execution of stateful load-balance updates. Exclude every step whose capture count
 increases, as well as JIT and kernel tuning, from steady-state throughput measurements.
 
-Each compiled forward or backward owns one reusable scratch set and one private CUDA memory pool.
+BF16 CP1 DualPipeV training additionally uses explicit layer and training-step ownership. Each
+layer refreshes detached weight mirrors after its FSDP all-gather once per step; repeated addresses
+or tensor versions never authorize skipping that refresh. Owned state stays on its initial compute
+stream; foreign-stream calls execute ordinarily without refreshing mirrors or preparing owned
+graphs. A foreign backward records its actual input allocations on the consuming stream before
+the callable can clear arguments or replace tensor storage. Retirement also records an event before
+private graph storage can be reused; that event alone does not protect retained caller allocations.
+Backward writes the actual retained
+FP32 `main_grad`, preserving the original in-place accumulation order. FSDP zeros it at the first
+backward and reduces it once at step end; a forward-only step does not reduce old gradients again.
+
+Each owned compiled forward variant lazily reserves at most `2 * PP` saved-activation slots per
+layer and output-lifetime mode, with a corresponding backward graph per slot. There are at most
+three modes: fresh public outputs, executor-authorized activation borrowing, and borrowing with
+a retained private producer input. AOT's private saved-tensor tail may borrow
+graph storage. With EP greater than one, built-in executor calls may also borrow the normalized
+stage-1 activation: dispatch materializes separate token storage before returning. This requires
+unchanged model methods and consumers, no observing hooks or tensor modes, and a saved tensor
+through which backward can identify the slot. Direct model calls retain fresh outputs. Residuals,
+routing results, tracked loss values, input aliases, and intermediate bases used to reconstruct
+public aliases keep ordinary escaping storage. In particular, a stage-5 callback may retain a
+residual after the corresponding backward and slot reuse. Installed saved-tensor hooks use the
+copying path. Slots retire after the whole layer backward succeeds; cross-stream fallback establishes
+an event before reuse, and exceptions leave outstanding slots quarantined. Each forward slot
+has its own capture pool: sharing pools would let an earlier graph's temporary overwrite a later
+graph's live saved tensor. Compatible input scratch can still be shared. Backward reads supported
+private saved views directly; mutable, negative, conjugated, and unmatched views retain copying.
+There are at most 12 compiled variants per owner, and no cache keyed by step or routing pattern.
+
+At an adjacent built-in aggregation/stage-1 boundary, a fresh unexposed input may additionally
+retain its forward staging copy in the slot. Backward reads that copy directly, removing a
+second transfer of the same input. Ordinary and boundary inputs remain copied. Producer class
+and instance methods, operand types, modes, fresh storage and the consumer's observers are
+checked explicitly; a router callback that replaces the compute entry invalidates authorization
+for that invocation even if the replacement later restores it. AOT still receives the original
+saved input alias and performs its normal version checks. The retained scratch is never shared
+with another slot or with ordinary calls, and public residuals remain fresh. This costs one
+additional hidden-state buffer per participating forward slot; it is bounded by the same pool
+limit and has not yet demonstrated a throughput benefit.
+
+A further experimental BF16 CP1 path captures the remaining dense transfers around computation.
+It publishes current source and fresh destination addresses through a device table, using at most
+128 event-protected pinned upload buffers per replay stream (256 int64 entries each). Dynamic
+CUDA tensors record that stream; input/weight freshness, output lifetimes, mutation versions and
+logical-view fallbacks remain explicit. Output addresses are bound after capture, and the planning
+capture never executes stateful computation. The kernels follow the CuTe SM90/TIRx SM100 operator
+boundary. The latest candidate passes 121 focused H200 checks, including stream ordering, pending
+upload reuse, transfers above 8 GiB and native metadata-guard fallback, plus import/lint/format
+checks. Eight-layer GPT and Qwen BF16 native checks pass (two forward/backward steps and manual
+weight mutation, not optimizer training). Initial full-model, one-node PP2/EP4/CP1 BF16 S4096
+MBS1/GBS64 timing pairs still lose throughput: GPT is 1.28% slower and Qwen 1.86% slower than
+graphs disabled. These are single candidate-selection pairs, not repeated acceptance evidence.
+Qwen's steady peak reserved memory reaches 134.30 GiB, leaving only about 189 MiB of sampled
+physical free memory; short-run stability does not establish headroom or an unlimited-run plateau.
+The implementation remains unqualified for performance, and the SM100 port is uncompiled and
+untested.
+
+Eligible concrete inputs use the pinned PyTorch native metadata checker. It retains metadata,
+not tensor storage; observing modes and stricter native misses use the original Python signature
+comparison. An outer TorchFunction scope restores state if a native metadata query throws.
+Storage, writable-alias, direct-save, owner/epoch, current-weight and stream guards remain live.
+Expected metadata for graph-owned saves is cached; caller views and retained producer aliases
+are checked on each invocation. Reduced helper cost has not established a training speedup.
+
+This ownership path is experimental: the tests below do not establish a throughput benefit.
+FP8, CP greater than one, and standalone compiled calls retain the shared copying path. In that
+path, each compiled forward or backward owns one reusable scratch set and a private CUDA memory pool.
 There are at most 12 such sets per process, shared across layers using the same compiled callable.
 Every call refreshes current inputs, including weights, FP8 operands and accumulated gradients.
-Copies are grouped by dtype and dense-layout eligibility. Strided slices stay separate so they
-do not force otherwise eligible tensors onto PyTorch's per-tensor foreach copy path. The groups
-contain indices only; they add no persistent tensor buffers.
+Under AOT's no-grad execution, aligned dense copies with mixed dtypes share one foreach launch
+through physical int32 views. These views preserve bits and version counters; only the static graph
+side is cached. Current offsets, pointer alignment and logical conjugate/negative flags are checked
+before each copy. Homogeneous copies, unsupported layouts/alignment, logical views and grad-enabled
+calls keep the grouped dtype/layout path. Strided slices stay separate in that fallback. Cached
+views refer to existing storage and are released with the graphs; they add no tensor storage.
 Mutations are copied back to the current caller's storage. Input aliases are returned against that
 storage; other outputs, including saved activations, are copied into ordinary allocations. Those
 allocations live until the corresponding micro-batch's backward, just as with graphs disabled.
-There is no graph or persistent activation set per micro-batch, optimizer step, or routing pattern.
+When AOT returns the same output view more than once, those returns share one escaping allocation
+within that invocation. Storage identity, offset, shape, strides, dtype, device and logical
+conjugate/negative flags must match; distinct replays still receive fresh escaping storage.
+Distinct view objects keep independent shape/stride metadata, while true repeated objects retain
+their identity within the invocation.
+This shared copying path has no graph or persistent activation set per micro-batch, optimizer
+step, or routing pattern. The owned path instead has the fixed slot bound described above.
 
 This ownership is necessary because FSDP frees and reallocates unsharded parameters and `main_grad`
 between steps. In particular, a forward may pass through `main_grad` while it has zero-byte storage;
 the graph does not read it until backward, after FSDP has allocated and zeroed it.
+Scratch placeholders that are neither read nor mutated retain their metadata and distinct storage
+identity but release their backing allocation after preparation. Writable inputs retain storage.
 
 GPT-OSS captures its existing `forward_stage1_compute` and backward: input norm, full or sliding
 attention (including learnable sinks and projection biases), residual addition, and post-attention
-norm. Its router and load-balance operations remain outside capture, as does aggregation. Full and
+norm, followed by router projection, top-k, softmax and optional load-balance operations. Route
+replay lookup, load-balance tracking, dispatch preparation and aggregation remain outside capture.
+Global-batch load balancing saves each forward's fraction vector for backward, so later live
+micro-batches and counter resets cannot change its gradient coefficients. Full and
 sliding attention specialize separately; graph counts depend on the compiled variants rather than
 a model-specific constant. GPT-OSS retains its existing CP=1 restriction.
+
+The pinned compiler also needs a first-launch metadata repair: an Inductor C++ wrapper can reuse
+a Triton autotuner while its descriptive kernel name points to another binary with a different
+argument layout. The lazy resolution helper runs the kernel once and republishes metadata from
+that actual launcher before C++ loads it. A compilation future is resolved once; if restoring an
+autotuner rebuilt its candidates but retained a cached fast launcher, initialization selects a
+candidate again before deriving its binary metadata. This process-local repair does not change the installed
+environment or add Python work to steady graph replay. Compile-time autotuning is outside its scope.
+Compiled stage setup enables Dynamo's module-hook guards, which the pinned default otherwise
+omits. The step-level guard-skip optimization is disabled while router hooks are installed, so
+hook addition/removal and changes to their captured Python state remain observable.
 
 Model families other than Qwen3 MoE and GPT-OSS, and packed micro-batches, are rejected when graphs
 are requested. GPT-OSS-20B and GPT-OSS-120B share this implementation; testing one does not validate
@@ -60,7 +151,8 @@ rank. NCCL requires this release order when graphs retain collective operations;
 [NVIDIA's teardown guidance](https://docs.nvidia.com/dl-cuda-graph/troubleshooting/process-hang.html).
 
 `pithtrain.pipeline.cuda_graphs.graph_stats()` reports captured instance count, forward/backward
-replays, ordinary calls, and capture time. Peak allocated **and reserved** CUDA memory should be
+replays, ordinary calls, capture time, owned instances, slot/live-save counts, direct saved-input
+replays, actual executor-output slot/replay counts, and weight-mirror bytes/refreshes. Peak allocated **and reserved** CUDA memory should be
 measured separately during startup/capture and steady state on every rank. Input/output copies and
 private pools have a cost; capture success alone does not establish a throughput benefit.
 
@@ -676,6 +768,149 @@ benefit. This coverage is GPT-OSS-20B on H200 with PyTorch 2.13.0+cu130, FA4 4.0
 QuACK 0.6.5; it does not establish a benefit for GPT-OSS or results for the untested configurations
 listed above. Graphs remain opt-in.
 
+## Replay allocation follow-up
+
+Profiling the shared backend found repeated residual outputs and unread forward `main_grad`
+placeholders. The backend now copies each exact repeated output view once and releases backing
+storage for placeholders that are neither read nor mutated. Distinct view objects keep independent
+metadata, and every invocation still receives fresh escaping storage. Current weights, inputs and
+accumulated gradients are refreshed on every replay; pointer equality is not a freshness check.
+
+The following diagnostics use H200, BF16, fresh weights, force-balanced routing, five warmup
+steps and one Nsight Systems step with graph-node detail. The original backend is
+`bbc7dd069175b490ed3f2f98e1c546d87a29a9b6`; the revised training-source SHA-256 is
+`6a8e2f7c4f8a468c708725f006e13b8970f05a1704f218aacd896c735dca1bd4`.
+
+| Model, GPUs, PP/EP/CP, S, MBS/GBS | Original → revised copy GPU ms/rank | Output-copy reduction ms/rank |
+| --- | --- | --- |
+| GPT-OSS-20B, 8, 2/4/1, 4096, 1/64 | 85.425–88.133 → 83.424–86.318 | 1.638–1.809 |
+| Qwen3-30B-A3B, 8, 2/4/1, 4096, 1/64 | 177.467–181.823 → 175.529–179.784 | 2.347–2.592 |
+| Qwen3-30B-A3B, 16, 2/8/1, 4096, 2/512 | 579.299–600.541 → 563.273–589.754 | 9.161–10.222 |
+
+These are summed GPU activities, not critical-path savings or throughput measurements. The
+original host signature/storage checks consume 14.975–16.047, 36.035–38.293 and 76.028–78.736 ms
+per rank respectively. Most input copies and host checks remain. Major attention and GEMM launch
+counts match the graph-disabled path; no extra launches were found in those families. Communication
+overlap varies by rank and does not establish a uniform communication-delay explanation. Replacing
+grouped copies with individual copies did not reduce GPU copy time in the isolated GPT diagnostic
+and increased host enqueue cost, so the grouped-copy implementation is retained.
+
+All 27 focused checks pass, including repeated-output identity, distinct-view metadata mutation,
+non-dense offsets, multiple retained replays, negative/conjugate values, sink/bias gradients and
+optimizer updates. Final-source native references also pass for GPT BF16/FP8 at PP2/EP2/CP1,
+S256 on four GPUs; Qwen BF16/FP8 at PP2/EP4/CP1, S128 on eight GPUs; and Qwen BF16 at
+PP2/EP8/CP2, S128 on sixteen GPUs. They use eight layers, MBS3 and 20 local chunks; GPT retains
+its 8192-vocabulary fixture, while Qwen uses 151936. These native checks use two F/B steps and
+manual weight mutation for canonical export, with the existing tolerances and noise-floor skips.
+They do not replace full-model optimizer training or performance measurements.
+
+The allocation cleanup is **not an established throughput fix**. Its 32-step real-routing
+comparisons pass on one H200 node at PP2/EP4/CP1, BF16, S4096, MBS1/GBS64: cross-entropy/load-balance
+envelope ratios are 0.827/0.738 for GPT-OSS-20B and 0.793/0.687 for Qwen3-30B-A3B. The two-node
+correctness comparisons and the seven-configuration repeated timing matrix remain incomplete.
+Earlier allocation-prototype timing still showed approximately 3% lower GPT throughput than
+graphs disabled. Reduced scratch memory and successful replay do not establish a speedup.
+
+A subsequent BF16 experiment computed weight-gradient contributions in scratch and added them
+to the current accumulator, avoiding its input copy. Single unprofiled diagnostic pairs at the
+same one-node configuration measured 2.169555 → 2.252499 seconds for GPT and 2.558142 → 2.690930
+seconds for Qwen (graphs disabled → experiment): throughput fell 3.68% and 4.93%, respectively.
+These are max-rank medians over steps 6–12 of 12-step force-balanced runs, with matching source,
+inputs and physical GPUs within each pair. They are not repeated performance acceptance evidence.
+That experiment is excluded from this implementation; the backend retains ordinary gradient
+accumulation and all input/output ownership safeguards. The remaining slowdown is unresolved.
+
+## Bounded ownership experiment
+
+The BF16 CP1 ownership path described above was tested at training-source SHA-256
+`dd3b7be9b4b4de36972347fcc9511907d85cf9b7cb0337ba745c805549c2ccc4`.
+It is **not a demonstrated throughput fix**. Forty focused tests pass, including optimizer
+updates, replaced weights/accumulators, concurrent live forwards, private saved views,
+public/intermediate aliases, hooks, stream fallback, and failed-backward quarantine. Ruff,
+formatting, import-layer and FA4 memoization checks pass.
+
+Both BF16 native references pass: GPT-OSS-20B on four H200s at PP2/EP2/CP1, S256, and Qwen3-30B-A3B
+on eight H200s at PP2/EP4/CP1, S128. Both use eight layers, MBS3 and 20 chunks; GPT uses the existing
+8192-token vocabulary fixture and Qwen uses 151936. Maximum parameter-gradient differences are
+0.000749 and 0.001807 respectively. GPT output and sink/bias checks pass. Every rank captures
+20 graphs, uses ten forward slots, records 80 forward/backward/direct-saved-input replays, and
+ends with no live saved tensors. These remain two-F/B/manual-weight-mutation checks, not
+optimizer-step training comparisons.
+
+Initial full-model timing uses one eight-H200 node, PP2/EP4/CP1, BF16, S4096, MBS1/GBS64,
+12 force-balanced steps, and the synchronized max-rank median over steps 6–12. Each enabled/
+disabled pair uses identical source, corpus, configuration, packages and physical GPUs.
+
+| Model | Disabled → owned replay seconds | Throughput change | Graphs / forward slots per rank |
+| --- | --- | --- | --- |
+| GPT-OSS-20B | 2.169768 → 2.194690 | −1.14% | 60 / 30 |
+| Qwen3-30B-A3B | 2.558101 → 2.601955 | −1.69% | 120 / 60 |
+
+These are single candidate-selection pairs; no repeatable gain is claimed. Every rank keeps
+constant graph/slot counts and zero live saves at step boundaries. Final replay counts are
+2112 F/B/direct for GPT and 4224 for Qwen, with one mirror refresh per layer per step.
+
+| Model | Steady allocated GiB, disabled → replay | Reserved GiB, disabled → replay | Minimum sampled free GiB, disabled → replay |
+| --- | --- | --- | --- |
+| GPT-OSS-20B | 65.929 → 69.304 | 77.184 → 82.957 | 57.306 → 51.524 |
+| Qwen3-30B-A3B | 91.446 → 96.560 | 113.510 → 119.830 | 21.042 → 14.690 |
+
+Startup allocated maxima are 65.939 → 69.313 GiB for GPT and 91.446 → 96.560 GiB for Qwen;
+startup reservation maxima equal the table. Maximum summed capture time is 0.452/0.562 seconds
+for GPT/Qwen, excluded from timing. No rank logs an allocation failure or shows end-of-step
+allocated/reserved growth over the seven-step timing window. This does not establish a
+real-routing allocator plateau or long-run memory safety.
+
+A matching GPT step-six trace measures 26.894–27.282 ms/rank of remaining copy-kernel activity,
+versus 85.425–88.133 ms in the historical original trace. Actual per-instance replay deltas give
+34.12994 GiB/rank of logical payload: 21.46875 GiB into scratch and 12.66119 GiB out. These are
+payload and GPU-activity measurements, not DRAM traffic or additive wall-time savings. The four
+large backward inputs are the original layer input, a saved public residual, and two tangents.
+Nested dispatch/leaf CPU ranges are deduplicated in the revised analysis. Profile instrumentation
+changes the on/off timing relationship; only unprofiled runs can support throughput claims.
+
+Two deliberately unsafe fixed-workload diagnostics do not validate implementation changes.
+Borrowing public outputs saves 10.268 ms against its diagnostic control but violates retained
+output/hook lifetimes. Omitting the remaining activation/tangent copies atop that mechanism saves
+another 13.242 ms in a separate matched experiment, while using stale values and changing losses.
+Those effects must not be added or treated as correct training speedups. Bypassing all replay
+guards on the ownership backend changes 2.196050 to 2.196154 seconds, with no measured benefit.
+Production retains the guards, current input copies, and fresh public outputs.
+
+For this earlier ownership experiment, public-save shadow mapping and per-slot input retention
+were unimplemented hypotheses. The later retained-input path described above still has no
+demonstrated throughput gain. A shadow mapping must establish immutability and preserve alias/mutation
+semantics; a pointer or version alone does not detect every external write. Eliminating incoming
+tangent or fresh-output transfers further requires a producer/consumer buffer-lifetime contract
+or validated dynamic operand rebinding. Neither capability is established by these experiments.
+The current source has not completed the four full-model real-routing comparisons, all five
+native configurations, or the seven repeated timing configurations required for the performance
+follow-up. Earlier-source FP8/CP and full-model correctness results do not validate this ownership
+path. Throughput acceptance remains unmet; no final performance-qualified change is established.
+
+### Later transfer and host-batching screen
+
+A later task-only prototype combines indirect forward/backward operands with native metadata and
+pointer-publication batching. The production source was
+`a36313198b59b01a11c0403023d298b0c5e368949dfd60f8e5e82eaf1700e29a`;
+compiler/native helper injections were recorded separately and are not adopted production code.
+On one eight-H200 node at PP2/EP4/CP1 BF16, S4096 MBS1/GBS64, each arm ran 25 force-balanced
+steps with identical post-warmup GC policy. Maximum-rank synchronized medians use steps 6–25.
+
+| Model | Disabled seconds | Indirect F/B seconds | Indirect F/B + host batching seconds | Combined throughput vs disabled |
+| --- | ---: | ---: | ---: | ---: |
+| GPT-OSS-20B | 2.106438346 | 2.113323366 | 2.110077239 | −0.172453% |
+| Qwen3-30B-A3B | 2.485667735 | 2.506811552 | 2.507393310 | −0.866461% |
+
+These single screening triplets establish no repeatable gain. Every measured combined replay
+uses the intended native checks/publication, with no recapture or fallback growth. End-of-step
+allocated/reserved memory is flat over this finite window; no long-run plateau is claimed.
+The prototype passes 34 focused cases, ten observer/version/stream/global-load-balance cases,
+and the two BF16 eight-layer native fixtures above (two F/B steps plus manual weight mutation,
+not full-model optimizer correctness). Passing those checks does not qualify its performance.
+The combined prototype is rejected; the full performance acceptance matrix remains incomplete.
+Host spans and GPU-copy activity do not identify an additive, recoverable wall-time budget.
+
 ## DeepSeek V2-Lite portability assessment
 
 DeepSeek remains rejected by the setup allowlist. Source inspection has not established a
@@ -686,6 +921,7 @@ No pipeline schedule change or model registry is needed.
 | Source and entry | Concrete difference and required check |
 | --- | --- |
 | `models/deepseek_v2.py`, `DeepSeekV2DecoderLayer.forward_stage1_compute` | The first layer is dense (`first_k_dense_replace=1`); it returns before shared experts and routing. Later MoE layers compute shared experts and router results inside stage 1. Warm and count both static variants. The dense MLP and routed experts stay in stage 3. |
+| `models/deepseek_v2.py`, `DeepSeekV2DecoderLayer.forward_stage1`; `pipeline/execution.py`, `stage1_f` | Dense layers return `routing=None`, bypassing EP dispatch's materialization even when EP is greater than one. Their normalized output feeds the dense MLP directly. Keep that output in ordinary escaping storage until its separate consumer/lifetime contract is established; Qwen/GPT's dispatch-output borrowing rule is insufficient. |
 | `models/deepseek_v2.py`, `DeepSeekV2DecoderLayer.forward_stage5` | The existing comment records that merging aggregation with the next stage 1 changes forward bits. Retain this separate boundary. |
 | `models/deepseek_v2.py`, `DeepSeekV2Attention.forward` | CP1 decompresses MLA K/V before FA4. CP>1 calls the separate MLA ring, passing `kv_b_proj.weight` directly and optional quantized operands. Qwen's ring validation does not cover this path. |
 | `operators/fp8_swiglu_mlp.py`, `fp8_swiglu_mlp` and its backward | Shared experts add saved gate/up activations and transposed FP8 operands to capture. The fused path requires a multiple of 128 rows. Check all shared-projection gradients, current weights and saved-activation lifetimes for several outstanding micro-batches. |
@@ -702,7 +938,10 @@ failures. They are not covered by GPT-OSS results.
 The smallest next validation is one actual-geometry dense layer and one MoE layer at CP1,
 sequence 256/MBS1, first BF16 then FP8. Compare ordinary and captured outputs, input gradients and
 all shared-expert gradients over live micro-batches and replaced/updated weights, with bounded
-graph counts. Then use the eight-layer PP2/EP2/CP1 native fixture for FSDP storage lifetimes.
+graph counts. Start with ordinary escaping public outputs, without the experimental executor
+output or retained-producer-input loans. Then use the eight-layer PP2/EP2/CP1 native fixture for
+FSDP storage lifetimes and shared-expert accumulation. Any later borrowing must separately prove
+the dense and MoE producer/consumer contracts, including observing hooks and method replacement.
 Before enabling CP, add a separate two-GPU CP2 MLA replay check at sequence 512/MBS1 (256 local
 tokens and 128-token half-blocks), using the unsharded dense and FP8 references in
 `tests/operators/test_ring_attention.py`. No DeepSeek model CUDA-graph run or performance claim accompanies

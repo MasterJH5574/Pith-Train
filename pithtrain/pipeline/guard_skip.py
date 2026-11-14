@@ -17,7 +17,7 @@ compiles during a skipped step, every signature loses its trust.
 Skipping is off when decoder layers differ in module structure (qwen3.5 linear vs full attention,
 deepseek-v2 dense vs MoE): guards copied from one variant look up submodules the other lacks, and
 Dynamo raises instead of trying the next entry. It is also off on torch releases other than the
-one it was validated on.
+one it was validated on, and while routers have hooks whose Python state is not in the signature.
 """
 
 from typing import Any, Hashable, List, Tuple
@@ -95,15 +95,25 @@ def object_config(obj: Any) -> Tuple | None:
 def scan_modules(model: torch.nn.Module) -> Tuple[Tuple, Tuple, Tuple, bool]:
     """
     Return the training flag of every module, the router-replay and load-balance configuration of
-    every gate, the decoder layer variants, and whether all layers share one module structure. A
-    layer's variant is its structure plus the attributes that select a different
-    compiled cache entry.
+    every gate, the decoder layer variants, and whether skipping is safe: uniform layer structure
+    and no router hooks. A layer's variant is its structure plus the attributes that select a
+    different compiled cache entry.
     """
     modes, gates, layers = [], [], []
+    router_hooks = False
 
     def visit(module: torch.nn.Module) -> Tuple:
+        nonlocal router_hooks
         modes.append(module.training)
         if hasattr(module, "router_replay"):
+            # Router Module.__call__ is inside compiled stage 1. Hooks can be added/removed
+            # after a trusted step and their captured Python state can change between calls.
+            router_hooks |= bool(
+                module._forward_pre_hooks
+                or module._forward_hooks
+                or module._backward_pre_hooks
+                or module._backward_hooks
+            )
             gates.append(
                 (
                     object_config(module.router_replay),
@@ -129,7 +139,7 @@ def scan_modules(model: torch.nn.Module) -> Tuple[Tuple, Tuple, Tuple, bool]:
 
     visit(model)
     uniform = len({layer[0] for layer in layers}) <= 1
-    return tuple(modes), tuple(gates), tuple(layers), uniform
+    return tuple(modes), tuple(gates), tuple(layers), uniform and not router_hooks
 
 
 def tensor_signature(tensor: torch.Tensor | None) -> Tuple | None:
@@ -145,7 +155,7 @@ class GuardSkip:
 
     def signature(self, model: torch.nn.Module, microbatches: List[Any]) -> Tuple | None:
         """
-        None when the step may never run unguarded (decoder layers of different module structure).
+        None when the step may never run unguarded (mixed layer structures or router hooks).
         """
         modes, gates, layers, uniform = scan_modules(model)
         if not uniform:

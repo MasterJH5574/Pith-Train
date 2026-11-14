@@ -1,8 +1,10 @@
+from functools import partial
 from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.distributed
 import torch.distributed._functional_collectives as funcol
+from torch.utils.checkpoint import checkpoint, create_selective_checkpoint_contexts
 
 __all__ = [
     "GlobalBatchLoadBalanceLoss",
@@ -81,6 +83,10 @@ class MicroBatchLoadBalanceLoss:
         pass
 
 
+def global_load_balance_value(scores, counts, total):
+    return torch.dot(counts / total, scores.mean(dim=0))
+
+
 class GlobalBatchLoadBalanceLoss:
     """
     Global-batch load-balance loss (https://arxiv.org/abs/2501.11873): f_i is the fraction of tokens
@@ -127,10 +133,23 @@ class GlobalBatchLoadBalanceLoss:
         self.count_buffer.add_(tokens_per_expert.detach())
         self.total_tokens.add_(num_tokens * top_k * self.group_size)
 
-        f = self.count_buffer / self.total_tokens
-        p = scores.mean(dim=0)
-
-        return self.lb_coef * num_experts * torch.dot(f, p)
+        if torch.compiler.is_compiling():
+            # Backward needs this forward's fractions, not the counters after another live
+            # micro-batch updates them. A plain clone can be moved into AOT recomputation;
+            # require the division result to be saved across the compiled boundary instead.
+            value = checkpoint(
+                global_load_balance_value,
+                scores,
+                self.count_buffer,
+                self.total_tokens,
+                use_reentrant=False,
+                context_fn=partial(
+                    create_selective_checkpoint_contexts, [torch.ops.aten.div.Tensor]
+                ),
+            )
+        else:
+            value = global_load_balance_value(scores, self.count_buffer, self.total_tokens)
+        return self.lb_coef * num_experts * value
 
     def reset(self) -> None:
         if self.count_buffer is not None:
