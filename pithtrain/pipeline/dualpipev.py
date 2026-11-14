@@ -542,6 +542,42 @@ class DualPipeV(nn.Module):
         if (
             training.cuda_graphs
             and not training.fp8
+            and distributed.cp_size > 1
+            and distributed.ep_size > 1
+            and torch.is_grad_enabled()
+        ):
+            from pithtrain.pipeline.cuda_graphs import pipeline_outputs_allowed
+            from pithtrain.pipeline.graph_buffers import CombineBufferPool, scheduled_graph_buffers
+
+            layers = [layer for module in self.module for layer in module.layers.values()]
+            eligible = all(
+                getattr(layer, "supports_scheduled_graph_buffers", False)
+                and pipeline_outputs_allowed(layer, scheduled=True)
+                for layer in layers
+            )
+            if eligible:
+                try:
+                    with torch.autograd.graph.disable_saved_tensors_hooks(
+                        "scheduler-owned combine buffers cannot escape through saved-tensor hooks"
+                    ):
+                        pass
+                except RuntimeError:
+                    eligible = False
+            if eligible:
+                if not hasattr(self, "combine_graph_buffers"):
+                    # DualPipeV keeps at most these many microbatches live in each V chunk.
+                    # Slots are allocated lazily and recycled after each aggregation backward.
+                    bound = len(self.module[0].layers) * (
+                        2 * distributed.pp_size - distributed.pp_rank
+                    ) + len(self.module[1].layers) * (distributed.pp_rank + 1)
+                    self.combine_graph_buffers = CombineBufferPool(bound)
+                with scheduled_graph_buffers(self.combine_graph_buffers):
+                    return self.guard_skip.run(
+                        self, microbatches, self.run_step, microbatches, objective
+                    )
+        if (
+            training.cuda_graphs
+            and not training.fp8
             and distributed.cp_size == 1
             and torch.is_grad_enabled()
         ):

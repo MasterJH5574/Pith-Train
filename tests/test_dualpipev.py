@@ -646,8 +646,14 @@ def main(model_name: str):
         bound = (
             MAX_GRAPHS * max(1, stats.get("owners", 0)) * (stats.get("max_leases_per_owner", 0) + 1)
         )
+        bound += MAX_GRAPHS * stats.get("combine_buffer_max_slots", 0)
         assert 0 < stats["instances"] <= bound, stats
         assert stats.get("live_saved_storages", 0) == 0, stats
+        assert stats.get("combine_buffer_live", 0) == 0, stats
+        if not ragged and not training.fp8 and cp_size > 1 and config.model_type == "qwen3_moe":
+            assert stats["combine_buffer_slots"] > 0, stats
+            assert stats["scheduled_instances"] > 0 and stats["scheduled_direct_replays"] > 0, stats
+            assert stats["combine_buffer_peak_live"] <= stats["combine_buffer_max_slots"], stats
         if (
             not ragged
             and not training.fp8

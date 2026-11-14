@@ -20,6 +20,7 @@ from torch.utils._device import DeviceContext
 
 from pithtrain.contexts import distributed, training
 from pithtrain.operators.graph_copy import GraphCopy
+from pithtrain.pipeline import graph_buffers
 
 __all__ = ["capture_pending", "compile_stage", "graph_stats", "release_graphs"]
 
@@ -100,11 +101,11 @@ def private_producer_allowed(producer, consumer):
     )
 
 
-def pipeline_outputs_allowed(module):
+def pipeline_outputs_allowed(module, *, scheduled=False):
     """Check observers and the constructor's consumer contract immediately before compute."""
     contract = getattr(module, "cuda_graph_output_contract", None)
     allowed = (
-        pipeline_output_leases
+        (pipeline_output_leases or scheduled)
         and distributed.ep_size > 1
         and contract is not None
         and observer_modes_absent()
@@ -574,6 +575,7 @@ def release_graphs():
             "saved_scratch_inputs",
             "retained_scratch_inputs",
             "saved_retained_scratch_inputs",
+            "scheduled_scratch_inputs",
             "input_word_views",
             "output_word_views",
             "signature_guard",
@@ -604,6 +606,8 @@ def release_graphs():
         owner.stream = None
     for graph in live:
         graph.bound.clear()
+    for pool in graph_buffers.pools:
+        pool.graphs.clear()
 
 
 @cache
@@ -621,6 +625,19 @@ def graph_stats() -> dict:
         "backward_replays": sum(g.replays for g in live if g.backward),
         "fallbacks": sum(g.fallbacks for g in live),
         "capture_seconds": sum(g.capture_seconds for g in live),
+        "scheduled_instances": sum(g.graph is not None and bool(g.scheduled_inputs) for g in live),
+        "scheduled_direct_replays": sum(g.replays for g in live if g.scheduled_inputs),
+        "combine_buffer_slots": sum(len(pool.slots) for pool in graph_buffers.pools),
+        "combine_buffer_bytes": sum(
+            slot.tensor.numel() * slot.tensor.element_size()
+            for pool in graph_buffers.pools
+            for slot in pool.slots
+        ),
+        "combine_buffer_max_slots": sum(pool.max_slots for pool in graph_buffers.pools),
+        "combine_buffer_peak_live": max(
+            (pool.peak_live for pool in graph_buffers.pools), default=0
+        ),
+        "combine_buffer_live": sum(pool.live for pool in graph_buffers.pools),
         "owned_instances": sum(g.graph is not None and g.owner is not None for g in live),
         "owners": len(owners),
         "max_leases_per_owner": max((o.max_leases for o in owners.values()), default=0),
@@ -884,6 +901,8 @@ class StaticGraph:
         saved_from=None,
         pipeline_outputs=(),
         retained_inputs=(),
+        scheduled_inputs=None,
+        scheduled_pool=None,
     ):
         self.fn = fn
         self.parent = parent
@@ -892,6 +911,9 @@ class StaticGraph:
         self.saved_outputs = tuple(saved_outputs)
         self.pipeline_outputs = tuple(pipeline_outputs)
         self.retained_inputs = tuple(retained_inputs)
+        self.scheduled_inputs = scheduled_inputs or {}
+        self.scheduled_pool = weakref.ref(scheduled_pool) if scheduled_pool is not None else None
+        self.scheduled_input_keys = {}
         self.retained_saved_outputs = set()
         self.saved_from = saved_from
         self.saved_inputs = {}
@@ -1047,7 +1069,9 @@ class StaticGraph:
         parent = self.parent
         self.map_saved_inputs(args)
         prefix = (
-            "saved_retained_"
+            "scheduled_"
+            if self.scheduled_inputs
+            else "saved_retained_"
             if self.saved_from is not None and self.saved_from.retained_inputs
             else "saved_"
             if self.saved_from is not None
@@ -1080,7 +1104,7 @@ class StaticGraph:
             return
         if any(tensor is None for _, tensor in self.bound.values()) or (
             shared is not None
-            and set(self.bound) | set(self.saved_inputs)
+            and set(self.bound) | set(self.saved_inputs) | set(self.scheduled_inputs)
             != getattr(parent, prefix + "scratch_bound")
         ):
             self.bound.clear()
@@ -1091,7 +1115,9 @@ class StaticGraph:
                 tensor.cuda_graph_retain = True
         self.copy_mutations = tuple(i for i in self.mutated_inputs if i not in self.bound)
         self.inputs = [
-            None
+            x.detach()
+            if i in self.scheduled_inputs
+            else None
             if i in self.saved_inputs
             else self.bound[i][1]
             if i in self.bound
@@ -1109,14 +1135,18 @@ class StaticGraph:
                 parent,
                 prefix + "scratch_inputs",
                 [
-                    None if i in self.retained_inputs else value
+                    None if i in self.retained_inputs or i in self.scheduled_inputs else value
                     for i, value in enumerate(self.inputs)
                 ],
             )
             setattr(parent, prefix + "scratch_stream", self.stream)
             setattr(parent, prefix + "scratch_retained", self.retained_inputs)
             setattr(parent, prefix + "scratch_key", self.key)
-            setattr(parent, prefix + "scratch_bound", set(self.bound) | set(self.saved_inputs))
+            setattr(
+                parent,
+                prefix + "scratch_bound",
+                set(self.bound) | set(self.saved_inputs) | set(self.scheduled_inputs),
+            )
 
         # Output-only placeholders (notably forward main_grad) need metadata and a distinct
         # storage identity, but no backing allocation. Never discard a writable input's storage.
@@ -1134,11 +1164,13 @@ class StaticGraph:
             if isinstance(args[i], torch.Tensor)
             and i not in self.bound
             and i not in self.saved_inputs
+            and i not in self.scheduled_inputs
         ]
         self.copy_destinations = [copy_view(self.inputs[i], dims) for i, dims in self.copy_sources]
         self.input_copy_groups = copy_groups(self.copy_destinations)
         self.input_word_views = static_copy_words(self.copy_destinations, self.input_copy_groups)
         self.copy_inputs(args)
+        self.scheduled_input_keys = {i: tensor_view_key(args[i]) for i in self.scheduled_inputs}
 
     def capture(self):
         # Capture can be requested from a different current stream at the drained step
@@ -1293,6 +1325,46 @@ class StaticGraph:
         return signature(args) == self.key
 
     def __call__(self, args):
+        pool = graph_buffers.active_pool
+        if self.scheduled_pool is not None:
+            # Binding is valid only during the same scheduler's live combine lease. View
+            # metadata is checked too; storage identity alone does not authorize a new view.
+            if pool is not self.scheduled_pool() or any(
+                pool.binding(args[i]) is not slot
+                or (
+                    self.key is not None
+                    and tensor_view_key(args[i]) != self.scheduled_input_keys[i]
+                )
+                for i, slot in self.scheduled_inputs.items()
+            ):
+                self.fallbacks += 1
+                return self.fn(args)
+        elif pool is not None and self.owner is None:
+            bindings = {
+                i: slot
+                for i in self.read_inputs
+                if i not in self.mutated_inputs and (slot := pool.binding(args[i])) is not None
+            }
+            if bindings:
+                key = (self, tuple((i, tensor_view_key(args[i])) for i in bindings))
+                child = pool.graphs.get(key)
+                if child is None:
+                    if len(pool.graphs) >= pool.max_slots * MAX_GRAPHS:
+                        self.fallbacks += 1
+                        return self.fn(args)
+                    child = StaticGraph(
+                        self.fn,
+                        self.read_inputs,
+                        self.mutated_inputs,
+                        self.backward,
+                        parent=self,
+                        scheduled_inputs=bindings,
+                        scheduled_pool=pool,
+                    )
+                    # No graph-owned result escapes: outputs/saves are copied before the
+                    # next replay. These variants can reuse their parent's temporary arena.
+                    pool.graphs[key] = child
+                return child(args)
         if self.owner is None and active_owner is not None:
             return active_owner.call(self, args)
         if self.saved_from is not None and self.graph is not None:
@@ -1354,6 +1426,7 @@ class StaticGraph:
                 and self.eligible(args)
                 and (
                     self.owner is not None
+                    or self.scheduled_pool is not None
                     or sum(g.key is not None and g.owner is None for g in live_graphs())
                     < MAX_GRAPHS
                 )

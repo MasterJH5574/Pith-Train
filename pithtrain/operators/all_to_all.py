@@ -52,6 +52,8 @@ def all_to_all_async(
     output_split_sizes: List[int],
     input_split_sizes: List[int],
     group: torch.distributed.ProcessGroup,
+    *,
+    out: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.distributed.Work]:
     """
     The caller waits on work before reading output. The split sizes and group are
@@ -60,11 +62,26 @@ def all_to_all_async(
     valid_size = sum(output_split_sizes)
     # NCCL reads x by these splits; a mismatch would read past the tensor.
     assert sum(input_split_sizes) == x.shape[0], "input splits do not cover the input rows"
-    padded_size = (
-        (valid_size + ALLTOALL_PAD_ALIGNMENT - 1) // ALLTOALL_PAD_ALIGNMENT * ALLTOALL_PAD_ALIGNMENT
-    )
-    buf = x.new_empty(padded_size, *x.shape[1:])
-    output = buf[:valid_size]
+    if out is None:
+        padded_size = (
+            (valid_size + ALLTOALL_PAD_ALIGNMENT - 1)
+            // ALLTOALL_PAD_ALIGNMENT
+            * ALLTOALL_PAD_ALIGNMENT
+        )
+        buf = x.new_empty(padded_size, *x.shape[1:])
+        output = buf[:valid_size]
+    else:
+        # The scheduler owns the destination until every consumer has completed. Validate
+        # before entering NCCL: a wrong split or alias must never become a device-side overrun.
+        if (
+            out.shape != (valid_size, *x.shape[1:])
+            or out.dtype != x.dtype
+            or out.device != x.device
+            or not out.is_contiguous()
+            or out.untyped_storage()._cdata == x.untyped_storage()._cdata
+        ):
+            raise ValueError("all-to-all destination must be a separate contiguous matching tensor")
+        output = out
     if group is not None and not torch.compiler.is_compiling():
         work = group.all_to_all_single(
             output, x, output_split_sizes, input_split_sizes, ASYNC_OPTIONS

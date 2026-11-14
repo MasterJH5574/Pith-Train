@@ -36,6 +36,11 @@ from pithtrain.pipeline.cuda_graphs import (
     private_producer_allowed,
     private_stage_input,
 )
+from pithtrain.pipeline.graph_buffers import (
+    acquire_combine_buffer,
+    detach_combine_buffer,
+    release_combine_buffer,
+)
 
 __all__ = [
     "ChunkRecord",
@@ -116,13 +121,15 @@ class ExecutionCtx:
     """
 
 
-def comm_all_to_all(ctx: ExecutionCtx, send_tensor: torch.Tensor, output_splits: List[int], input_splits: List[int]):  # fmt: skip
+def comm_all_to_all(ctx: ExecutionCtx, send_tensor: torch.Tensor, output_splits: List[int], input_splits: List[int], *, out=None):  # fmt: skip
     stream = ctx.comm_stream
     # Two direct stream switches instead of a torch.cuda.stream context, which costs more host time.
     prev = torch._C._cuda_getCurrentStream(stream.device_index)
     torch._C._cuda_setStream(stream.stream_id, stream.device_index, stream.device_type)
     try:
-        return all_to_all_async(send_tensor, output_splits, input_splits, distributed.ep_group)
+        return all_to_all_async(
+            send_tensor, output_splits, input_splits, distributed.ep_group, out=out
+        )
     finally:
         torch._C._cuda_setStream(*prev)
 
@@ -311,7 +318,10 @@ def stage4_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, co
 
     record.splits = combine_splits
     if combine_splits is not None:
-        moe_outs, ctx.fwd_comm_work = comm_all_to_all(ctx, moe_outs, combine_splits.input_splits, combine_splits.output_splits)  # fmt: skip
+        destination = acquire_combine_buffer(
+            moe_outs, sum(combine_splits.input_splits), ctx.comm_stream
+        )
+        moe_outs, ctx.fwd_comm_work = comm_all_to_all(ctx, moe_outs, combine_splits.input_splits, combine_splits.output_splits, out=destination)  # fmt: skip
     else:
         ctx.fwd_comm_work = None
 
@@ -354,7 +364,7 @@ def stage5_f(ctx: ExecutionCtx, layer: LayerProtocol, moe_outs: torch.Tensor, ro
     nvtx.range_push("layer%02d.stage5_f" % layer.idx)
     record = Stage5Record()
 
-    moe_outs = moe_outs.detach().requires_grad_()
+    moe_outs = detach_combine_buffer(moe_outs)
     topk_weight = routing.topk_weight if routing is not None else None
     topk_weight = topk_weight.detach().requires_grad_() if topk_weight is not None else None
     residual = residual.detach().requires_grad_()
@@ -376,6 +386,7 @@ def stage5_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage5Record, grad
     nvtx.range_push("layer%02d.stage5_b" % layer.idx)
 
     run_backward(record.outs, grad_tensors)
+    release_combine_buffer(record.args.moe_outs)
 
     ctx.comp_stream.record_event(ctx.bwd_event)
 
@@ -388,7 +399,7 @@ def stage5_b(ctx: ExecutionCtx, layer: LayerProtocol, record: Stage5Record, grad
 def stage5_stage1_f(ctx: ExecutionCtx, prev_layer: LayerProtocol, next_layer: LayerProtocol, moe_outs: torch.Tensor, routing: Optional[RoutingInfo], residual: torch.Tensor, rotary_posemb: Tuple[torch.Tensor, torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None):  # fmt: skip
     nvtx.range_push("layer%02d_stage5_f_layer%02d_stage1_f" % (prev_layer.idx, next_layer.idx))
 
-    moe_outs = moe_outs.detach().requires_grad_()
+    moe_outs = detach_combine_buffer(moe_outs)
     topk_weight = routing.topk_weight if routing is not None else None
     topk_weight = topk_weight.detach().requires_grad_() if topk_weight is not None else None
     residual = residual.detach().requires_grad_()
@@ -432,6 +443,7 @@ def stage1_stage5_b(ctx: ExecutionCtx, next_layer: LayerProtocol, prev_layer: La
         ctx.bwd_comm_work.wait()
 
     run_backward(stage1_outs, grad_tensors, graph_owner=next_layer)
+    release_combine_buffer(stage5_args.moe_outs)
 
     ctx.comp_stream.record_event(ctx.bwd_event)
 
@@ -538,7 +550,18 @@ def layer_forward_dispatch(dispatch_tokens: torch.Tensor, dispatch_splits: Optio
 def layer_forward_combine(outs: torch.Tensor, combine_splits: Optional[AllToAllSplits]):
     if combine_splits is None:
         return outs
-    return direct_all_to_all(outs, combine_splits.input_splits, combine_splits.output_splits, distributed.ep_group)  # fmt: skip
+    destination = acquire_combine_buffer(
+        outs, sum(combine_splits.input_splits), torch.cuda.current_stream(outs.device)
+    )
+    output, work = all_to_all_async(
+        outs,
+        combine_splits.input_splits,
+        combine_splits.output_splits,
+        distributed.ep_group,
+        out=destination,
+    )
+    output.comm_work = work
+    return output
 
 
 def layer_forward(
@@ -604,7 +627,7 @@ def layer_forward(
 
     nvtx.range_push("layer%02d.stage5_f" % layer.idx)
     record = Stage5Record()
-    moe_outs = moe_outs.detach().requires_grad_()
+    moe_outs = detach_combine_buffer(moe_outs)
     topk_weight = routing.topk_weight if has_experts else None
     topk_weight = topk_weight.detach().requires_grad_() if topk_weight is not None else None
     residual = residual.detach().requires_grad_()
@@ -646,6 +669,7 @@ def layer_backward(
         nvtx.range_push("layer%02d.stage5_b" % layer.idx)
         run_backward(stage5_record.outs, output_grads)
     moe_outs_grad, topk_weight_grad, residual_grad = [arg.grad if arg is not None else None for arg in stage5_record.args]  # fmt: skip
+    release_combine_buffer(stage5_record.args.moe_outs)
     nvtx.range_pop()
 
     nvtx.range_push("layer%02d.stage4_b" % layer.idx)

@@ -237,6 +237,8 @@ class Qwen3MoeAttention(nn.Module):
 
 
 class Qwen3MoeDecoderLayer(nn.Module):
+    supports_scheduled_graph_buffers = True
+
     def __init__(self, config: Qwen3MoeConfig, layer_id: int):
         super().__init__()
         self.idx = layer_id
@@ -314,7 +316,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
         With CUDA graphs, capture only stage 1 to avoid copying the larger expert-output buffers.
         """
         replay_idx = replay_indices(self.mlp.gate, residual, self.mlp.num_experts_per_tok)
-        if training.cuda_graphs and torch.is_grad_enabled():
+        from pithtrain.pipeline.graph_buffers import is_combine_buffer
+
+        if training.cuda_graphs and torch.is_grad_enabled() and not is_combine_buffer(moe_outs):
             # Preserve the fused path's FSDP scheduling. Bypass the previous layer's registered
             # forward_stage5 wrapper: aggregation reads no parameters.
             private = private_producer_allowed(prev_layer, self)
