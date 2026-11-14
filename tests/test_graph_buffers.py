@@ -134,3 +134,25 @@ def test_scheduled_graph_inputs_replay_with_two_live_microbatches():
     finally:
         cg.release_graphs()
         training.cuda_graphs = previous
+
+
+def test_combine_spare_precedes_recent_retirement_and_reuse_is_fifo():
+    from pithtrain.pipeline.graph_buffers import CombineBufferPool, scheduled_graph_buffers
+
+    source = torch.ones(4, 8, device="cuda")
+    stream = torch.cuda.current_stream()
+    pool = CombineBufferPool(3)
+    with scheduled_graph_buffers(pool):
+        first = pool.acquire(source, 4, stream)
+        second = pool.acquire(source, 4, stream)
+        pool.release(second)
+        spare = pool.acquire(source, 4, stream)
+        assert spare.data_ptr() not in (first.data_ptr(), second.data_ptr())
+        pool.release(first)
+        reused = pool.acquire(source, 4, stream)
+        assert reused.data_ptr() == second.data_ptr()  # retired before the lower-index slot
+        pool.release(second)  # stale lease cannot enqueue this slot a second time
+        assert len(pool.available) == 1
+        pool.release(reused)
+        pool.release(spare)
+    assert pool.live == 0 and len(pool.slots) == 3

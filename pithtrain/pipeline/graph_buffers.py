@@ -6,6 +6,7 @@ microbatch that reuses its storage. CUDA events order reuse on the communication
 """
 
 import weakref
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -33,6 +34,7 @@ class CombineBufferPool:
         self.max_slots = max_slots
         self.shape_key = None
         self.slots = []
+        self.available = deque()
         self.by_storage = {}
         self.live = self.peak_live = self.acquisitions = self.reuses = 0
         self.graphs = {}
@@ -42,18 +44,23 @@ class CombineBufferPool:
         key = ((rows, *source.shape[1:]), source.dtype, source.device)
         if self.shape_key not in (None, key):
             return None  # A changed geometry keeps the ordinary allocation/capture path.
-        slot = next((slot for slot in self.slots if slot.lease is None), None)
-        if slot is None:
-            if len(self.slots) >= self.max_slots:
-                return None
+        # Fill the bounded pool before recycling. The scheduler includes one spare so the
+        # first combine after a backward can use independent storage while that backward
+        # is still reading its input on the compute stream.
+        if len(self.slots) < self.max_slots:
             slot = CombineSlot(source.new_empty(key[0]))
             self.slots.append(slot)
             self.by_storage[slot.tensor.untyped_storage()._cdata] = slot
             self.shape_key = key
-        else:
+        elif self.available:
+            # Retire order, not allocation index: prefer storage whose last read was queued
+            # longest ago. The event remains mandatory; FIFO is not a synchronization proof.
+            slot = self.available.popleft()
             self.reuses += 1
             if slot.ready is not None:
                 stream.wait_event(slot.ready)
+        else:
+            return None
         lease = CombineLease(slot)
         slot.lease = lease
         value = slot.tensor.detach()
@@ -78,6 +85,7 @@ class CombineBufferPool:
         slot.ready.record(torch.cuda.current_stream(value.device))
         lease.released = True
         slot.lease = None
+        self.available.append(slot)
         self.live -= 1
 
     def binding(self, value):
