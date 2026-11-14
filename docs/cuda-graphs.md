@@ -1,5 +1,267 @@
 # CUDA graphs for training
 
+## Consolidated investigation — 2026-11-14
+
+**Research result: graph capture works for Qwen3 and GPT-OSS, but a general throughput improvement
+has not been achieved. Do not enable the new schedule-buffer strategy in production on the basis
+of this branch.** This section supersedes earlier candidate-selection conclusions below. The
+main review branch retains the existing backend; a separate research branch preserves the schedule
+experiments as individually reviewable commits. Inclusion there is not performance promotion.
+The machine-readable companion, [cuda-graphs-evidence-20261114.json](cuda-graphs-evidence-20261114.json),
+records the measured results, immutable source identities and trace provenance.
+Review the existing backend on [agent-dev/task-4](https://github.com/MasterJH5574/Pith-Train/tree/agent-dev/task-4)
+and the schedule experiments on [agent-dev/task-4-schedule-research](https://github.com/MasterJH5574/Pith-Train/tree/agent-dev/task-4-schedule-research).
+The research series separates initial schedule binding (`7a9ca40`), FIFO reuse (`3585e2e`),
+non-owning scratch outputs (`1d85bdd`) and observer guards (`e9067cd`). The common replay-lifetime
+and captured-transfer changes are `c02c701`.
+
+### Completed throughput sweep
+
+All rows use H200, BF16 and micro-batch size 1. TPS is global tokens/second. Each arm has two
+independent runs; entries are medians of run-level throughput over steady steps 6–15. Peak allocated
+memory is the largest measured graph-on allocation, per rank. OOM attempts are excluded from paired
+comparisons; the table contains the completed adjusted configurations.
+
+| Model | Nodes | PP/EP/CP | Sequence | Global batch | Graph off TPS | Graph on TPS | Change | On peak GiB |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| GPT-OSS-20B | 1 | 1/8/1 | 4096 | 128 | 144,112 | 143,410 | -0.49% | 76.68 |
+| GPT-OSS-20B | 1 | 1/4/1 | 4096 | 128 | 140,562 | 140,214 | -0.25% | 90.05 |
+| GPT-OSS-20B | 1 | 2/4/1 | 4096 | 128 | 127,543 | 126,786 | -0.59% | 72.67 |
+| GPT-OSS-20B | 1 | 1/8/1 | 8192 | 128 | 148,529 | 148,351 | -0.12% | 100.58 |
+| Qwen3-30B-A3B | 1 | 1/8/2 | 4096 | 64 | 58,058 | 79,359 | +36.69% | 84.06 |
+| Qwen3-30B-A3B | 1 | 1/4/2 | 4096 | 64 | 58,933 | 77,845 | +32.09% | 102.75 |
+| Qwen3-30B-A3B | 1 | 2/4/1 | 4096 | 128 | 109,652 | 109,126 | -0.48% | 104.30 |
+| Qwen3-30B-A3B | 1 | 1/8/2 | 8192 | 64 | 92,273 | 89,279 | -3.24% | 96.86 |
+| Qwen3-30B-A3B | 1 | 1/8/2 | 8192 | 128 | 94,057 | 90,716 | -3.55% | 96.86 |
+| Qwen3-30B-A3B | 1 | 1/8/4 | 16384 | 64 | 71,602 | 70,254 | -1.88% | 96.87 |
+| GPT-OSS-20B | 2 | 2/8/1 | 8192 | 32 | 241,683 | 240,655 | -0.43% | 65.71 |
+| Qwen3-30B-A3B | 2 | 2/8/2 | 8192 | 64 | 169,845 | 166,007 | -2.26% | 63.24 |
+| Qwen3-30B-A3B | 2 | 2/8/2 | 8192 | 128 | 176,290 | 171,476 | -2.73% | 63.24 |
+| Qwen3-30B-A3B | 2 | 2/8/4 | 16384 | 128 | 138,085 | 135,528 | -1.85% | 63.25 |
+
+CP1 and CP>1 do **not** differ only in attention: CP1 uses experimental ownership/indirect
+transfers (plus a benchmark helper for native publication in GPT); CP>1 uses shared scratch and
+copies escaping activations and current operands. Compare graph on/off within a row, not backend
+performance across rows. Both S4096 winners use the same CP2 scratch backend as the S8192 regression,
+so switching backends cannot explain that sequence-length reversal. The final S8192 regression is
+about 3%, not 30%. The two-node regressions are about 2–3%; scale alone is not the explanatory variable.
+
+The percentage winners are also not necessarily the best absolute training mesh. The earlier Qwen
+CP1 graph-off S4096 observation was about 108k TPS, above the CP2 winners' 78–79k TPS; its graph-on
+partner did not complete, so it is not a qualified paired row. Configuration selection and the
+benefit of graph capture are separate decisions.
+
+### Whole-step evidence and the sequence-length reversal
+
+The original matched Qwen PP1/EP8/CP2, global-batch-64 comparison fixes rank 0, training step 6,
+layer/stage and micro-batch occurrence. Every GPU operation is correlated back to its CPU launch.
+The summaries and timeline viewer retain whole-step, stage and individual-kernel views of the
+same traces. Unprofiled timing is used for throughput conclusions.
+
+| Sequence | Profiled step off/on | GPU inactive time off/on | Added graph input/output copy activity |
+| --- | --- | --- | --- |
+| 4096 | 5952.6 / 4249.4 ms | 1900.4 / 653.6 ms | 108.65 / 65.38 ms |
+| 8192 | 6270.9 / 6154.9 ms | 685.4 / 677.9 ms | 177.98 / 100.47 ms |
+
+At S4096, substantial host submission gaps disappear. At S8192, the longer GPU work already hides
+much more host work; the remaining launch benefit is small, while copying scales with tensors.
+This supports a headroom-dependent explanation, not a universal claim that CPU submission never
+matters. Graph replay counts, stage counts, source identity and all-rank capture/fallback counters
+match expected execution counts and show no evidence of skipped work in the speedup runs. This is evidence against a skipped-work artifact,
+not a substitute for long real-routing correctness validation.
+
+Profiling perturbs the result: the S8192 profile itself is slightly faster with graphs, whereas
+unprofiled comparisons consistently lose roughly 2–3%. Therefore the 278 ms of copy activity is
+**not** a proven additive explanation of the unprofiled slowdown. CPU dispatch waits can grow
+when submission becomes faster and catches up with the GPU; those waits are not another independent
+cost to add. GPU activity, CPU issuance and exposed critical-path time are kept separate.
+In that same S8192 profile, compute union increases about 24.9 ms and copy activity adds 278.5 ms,
+but communication-only time drops about 413.3 ms and idle time drops 7.5 ms; other memory activity
+adds about 1.5 ms. These disjoint changes explain why this particular instrumented step is 116 ms
+faster even though the unprofiled runs regress. They prevent attributing the whole unprofiled
+regression to copies from an incompatible local measurement.
+
+For S8192, the shared backend moves about 428 GiB per rank per step through graph boundary copies.
+The captured ABI includes four FP32 projection-gradient accumulators totaling 72 MiB per backward;
+copy-in plus copy-back over 768 backward replays accounts for 108 GiB of that traffic. This is a
+byte-volume calculation, not an attribution of 108 GiB to a separately measured latency.
+
+### Capture coverage and the stage-5 experiment
+
+The original backend captures static stage 1 forward/backward: normalization, attention, router
+scores/top-k and applicable load-balance computation. CP ring-attention communication is inside
+that capture. GPT full/sliding attention, sinks and projection biases are covered by its separate
+compiled variants. Dynamic dispatch metadata, EP communication, routed expert stage 3, deferred
+expert weight gradients, FSDP orchestration and the optimizer remain outside.
+
+For the original Qwen CP2 rank-0 profiles, graph computation covers 46.1% of forward and 49.6% of
+backward layer-compute time at S4096; at S8192 it covers 53.1% and 56.2%. These denominators exclude
+communication, graph copies, embedding/head and optimizer work. **Routed expert stage 3 is 0%
+captured** in both directions. At S8192 it contributes approximately 418 ms forward and 1181 ms
+backward in this profile. Router work is fused into stage 1, so there is no honest standalone
+percentage for all “MoE work” without defining a finer attribution scheme.
+
+Stage 5 is static enough to capture. We implemented a Qwen BF16 CP>1 pilot that captures the
+existing fused stage-5/next-stage-1 callable, with bounded, schedule-owned combine inputs.
+Capturability was not the blocker. The expanded AOT boundary exports a large backward gradient
+and saved hidden tensor: at S8192 the initial prototype adds about 93.9 GiB of output traffic per
+rank/step, principally 83.4 GiB of stage-5 input gradients plus 10.4 GiB of saved hidden states.
+It also loses throughput; increased copies and reuse dependencies are candidate contributors.
+The original attention boundary was reasonable; expanding it
+without integrating the output and backward consumers makes the interface more expensive.
+
+### Schedule-aware reuse: implementation, ablations and limits
+
+The scheduler bounds live combine buffers using each chunk's layer count and DualPipeV pipeline
+position. Each acquired buffer has a lease; backward retirement records a compute-stream event;
+reuse on the communication stream waits for that event. The pool asserts that it drains after the
+step. Graph variants bind the actual combine slot directly, avoiding an input staging copy.
+
+The first-free policy immediately reused a just-retired backward slot, adding a forward-combine
+dependency on that backward. The matched initial-prototype trace was 188.9 ms slower: compute union
+fell 120.2 ms, copy activity rose 32.9 ms, communication-only time rose 133.8 ms, idle time rose
+143.4 ms, and other memory activity fell about 0.9 ms. These disjoint categories reconcile the
+profiled step delta; the ordering analysis and subsequent ablation support the dependency hypothesis.
+They do not establish that every extra idle millisecond has the same cause.
+
+FIFO retirement plus one spare slot recovered 1.6% throughput relative to that prototype, with
+identical copy volumes, but remained 0.9% behind the existing graph backend. The spare tensor was
+128 MiB; **total allocation grew by 8.1 GiB**, because more live graph variants retained their
+scratch output allocations. Counting the spare tensor alone had understated the overhead.
+
+We then adopted the relevant Transformer Engine ownership idea: keep non-owning views of temporary
+outputs whose allocation belongs to the matching private graph pool. Inputs and external allocations
+retain normal ownership; aliases and offsets are preserved, the graph keeps the pool alive, and
+all escaping outputs are copied before another replay may overwrite scratch. This reduced peak
+allocation from 121.8 to 100.2 GiB, with essentially unchanged throughput. The existing backend used
+96.9 GiB. Saving memory did not turn the prototype into a performance winner.
+
+Late hooks/callbacks can retain a supposedly private buffer. The final revision rejects saved-tensor
+observers throughout scheduled execution, temporarily permits only the compiler's internal setup,
+and rechecks model methods and callbacks at consumers. Only registered, unchanged force-balance
+callbacks qualify. Unsupported callbacks present at step entry use the ordinary path; unsupported
+callbacks added after scheduled execution begins raise before consuming pooled storage. This is deliberately a bounded
+research integration, not a general observer-safe zero-copy API.
+
+Final-source fresh comparisons, one run per arm on the same node, steps 6–15 maximum-rank medians:
+
+| Sequence | Backend | Step seconds | TPS | Change vs existing graphs | Peak allocated / reserved GiB |
+| ---: | --- | ---: | ---: | ---: | --- |
+| 4096 | Graphs off | 4.4533 | 58,866 | -25.71% | 83.71 / 101.53 |
+| 4096 | Existing graphs | 3.3082 | 79,240 | +0.00% | 84.07 / 101.75 |
+| 4096 | Schedule prototype a05 | 3.3752 | 77,667 | -1.99% | 85.80 / 100.14 |
+| 8192 | Graphs off | 5.7082 | 91,849 | +3.27% | 96.34 / 115.89 |
+| 8192 | Existing graphs | 5.8948 | 88,941 | +0.00% | 96.86 / 116.75 |
+| 8192 | Schedule prototype a05 | 5.9529 | 88,073 | -0.98% | 100.19 / 117.13 |
+
+These final runs are a qualification screen, not repeated acceptance evidence. No production
+performance promotion follows from a small single-run difference.
+
+### Megatron comparison: measured copies and integration differences
+
+We inspected and instrumented the installed implementations, rather than extrapolating from
+Megatron's end-to-end speedup. The matched-mesh captures use Qwen, one eight-H200 node,
+PP2/EP4/CP1, S4096, MBS1, global batch 64, real routing and step 6. They retain different corpora,
+software stacks, kernels and pipeline layer partitions (Pith 24/24, Megatron 25/23), so absolute
+cross-framework throughput is not a controlled ranking. This Pith core profile excludes the
+sweep-only native publication helper; its CPU timings must not be assigned to those helper rows.
+
+| Per-rank, per-step measurement | Pith core ownership/indirect backend | Megatron / Transformer Engine |
+| --- | --- | --- |
+| Replay-boundary device bytes | 39.33 GiB | 25.16–27.34 GiB |
+| GPU replay-copy activity | 25.11–26.28 ms | 17.54–19.13 ms |
+| CPU copy/publication NVTX spans | 70.09–89.86 ms | 63.84–78.48 ms |
+| Additional pointer-table upload | 768 uploads, 1.5 MiB; 2.61–2.75 ms GPU | Not this mechanism |
+| Pith weight-mirror refresh | 0.856 GiB; about 0.69–0.73 ms more D2D activity than off | Different parameter-storage integration |
+
+Every Pith replay has exactly one captured input-copy and one output-copy kernel; the GPU
+correlations match 384 forward plus 384 backward replays/rank. Table uploads match replay counts.
+The graph-on minus graph-off D2D byte difference exactly equals the weight-mirror allocation on
+every rank. Megatron's copy counts/bytes likewise match its instrumentation; no parameter-gradient
+clone calls were recorded. CPU spans include instrumentation and are not interchangeable with GPU
+time. Pith's public-output allocation and other wrapper checks are not all inside publication spans.
+
+**The hypothesis that Pith's CPU buffer-copy time must be vastly larger than Megatron's is not
+supported for this CP1 backend.** Issuance/publication spans are comparable. Pith copies more bytes,
+but the extra GPU transfer activity is measured in milliseconds, not seconds. The earlier roughly
+270 ms Pith copy result came from the CP2 shared backend and a different per-rank workload; it must
+not be directly compared with Megatron's 18 ms as if the implementation and configuration matched.
+
+In the matched CP1 rank-0 profile, Pith's step grows 3080.0 → 3161.8 ms. GPU inactive time grows
+358.7 → 495.2 ms, while compute union is approximately unchanged and communication-only time falls.
+The main-stream gap with the next launch not yet submitted grows 326.9 → 473.8 ms. Thus the instrumented owned path loses host-submission time; extra device copying alone does not
+explain the 81.8 ms profiled delta. Graph-on has additional NVTX instrumentation, so this is a
+measured location of lost time in the trace, not yet an attribution of the unprofiled regression
+to one Python function or proof that all of this time is production wrapper overhead.
+
+Megatron's earlier unprofiled comparisons improved roughly 40–44%. Its instrumented rank-0
+profile has much larger idle/submission headroom (about 6.93 → 2.93 seconds of GPU inactivity),
+whereas Pith already has compiled stages and comparatively little headroom in this configuration.
+The profiler perturbs Megatron substantially; these numbers establish the different timeline shape,
+not an unprofiled 4-second saving or an exact accounting of the 40% gain.
+
+Megatron captures attention, router and MoE preprocessing with Transformer Engine graph helpers.
+Its schedule-aware storage keeps saved tensors alive until their consumers and releases allocation
+ownership when safe; returned outputs can detach graph-backed storage instead of being copied.
+Pith's FSDP reallocations, deferred gradients and DualPipeV consumers require different lifetime
+contracts. We aligned ownership slots, direct saved inputs, stable weight mirrors, captured
+transfers and temporary-pool ownership where those contracts were proven. We did not replace
+DualPipeV or the expert stack with Megatron's. Matching the API or capture region alone cannot
+supply identical memory lifetimes or identical remaining host-launch headroom.
+
+### Validation, disposition and next work
+
+Final research source a05 passed 113 single-GPU checks. Six distributed checks skipped on that
+one-GPU allocation were then run separately on two H200s and all passed (119 checks in total).
+Coverage includes replay/mutation/alias lifetimes, public outputs, current weights, graph transfers,
+GPT full/sliding attention with sinks/biases, real and replayed routing, and distributed global
+load-balance gradients. The new schedule-buffer/observer unit run also passed all 11 checks.
+
+Cold-cache eight-layer native reference comparisons passed for Qwen PP1/EP8/CP2, Qwen PP2/EP4/CP2,
+and GPT PP1/EP8/CP1, at sequence 128/BF16. These cover forward/backward and manual parameter mutation;
+they are not a 32-step full-model optimizer acceptance run. Final S4096/S8192 throughput screens
+use the full Qwen model and force-balanced routing. Stable capture/fallback counts and drained
+buffer pools were checked over steady steps. The auxiliary-stream test synchronizes before graph
+reset; it does not prove teardown with outstanding replay. No SM100 runtime validation was done.
+
+Ruff lint and format checks passed for changed Python files. An independent read-only review found
+and prompted the late-observer fix, then found no remaining concrete blocker for the bounded
+research branch. One intermediate revision failed import layering and was corrected by moving the
+callback registry into contexts; this was not a numerical failure. The CP1 matched profile logged
+allocator OOM/reclaim attempts during startup but completed on all ranks, so its startup memory
+headroom remains a concern.
+
+We did not spend another long real-routing acceptance matrix on a candidate that failed the
+performance screen. Historical correctness runs below must not be read as final-a05 full-model
+qualification. The broader objective of repeatable speedups without correctness regressions remains
+unmet; passing these bounded checks is not a claim of universal correctness or production readiness.
+
+The new matched-mesh Megatron comparison is Qwen-only; it does not establish the cause of GPT's
+small throughput differences.
+
+The implementation uses generic replay machinery for Qwen and GPT-OSS, not a Qwen-only graph
+runtime. GPT remains CP1-only, matching its existing model restriction. DeepSeek V2-Lite has a
+source-level portability assessment below, not runtime support: dense-layer output lifetimes,
+shared-expert gradients, MLA and its CP ring need their own contracts/tests. No fundamental
+impossibility has been established for DeepSeek or for a future faster graph integration.
+
+The performance objective is **not met broadly**. The strong S4096 CP2 gains are repeatable and
+consistent with the same profiles' launch gaps; the other completed meshes show near-neutral
+performance or modest regressions. The new schedule integration demonstrates feasible bounded
+reuse and fixes a real memory-retention problem, but has not justified replacing the faster
+existing backend. Do not hardcode graph use universally on this evidence.
+
+Stop the broad sweeps and do not keep tuning the rejected stage-5 boundary. If development resumes,
+the next bounded experiment should eliminate a measured boundary cost by integrating both its
+producer and its backward consumer, then prove that the saved latency reaches the critical path.
+For CP1, first isolate the newly measured host submission gap in the same matched trace; for CP2,
+prioritize saved tensors and FP32 gradient accumulator copies rather than adding more capture.
+Require repeated unprofiled gains, base/base/candidate real-routing optimizer validation, and
+startup plus steady allocated/reserved memory before promotion. Another general graph API rewrite
+or a wider configuration sweep is not warranted by these findings.
+
+## Implementation reference and earlier experiment records
+
 Set `cfg.training.cuda_graphs = True` to opt into CUDA graph replay. The default is `False`;
 use separate processes with otherwise identical configurations for comparisons. The implementation
 uses the pinned PyTorch 2.13 Inductor/AOTAutograd interfaces.
