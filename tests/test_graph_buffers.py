@@ -131,6 +131,11 @@ def test_scheduled_graph_inputs_replay_with_two_live_microbatches():
         assert any(g.backward and g.replays for g in direct)
         for graph in direct:
             assert set(graph.scheduled_inputs).isdisjoint(i for i, _ in graph.copy_sources)
+        assert all(g.nonowning_output_bytes > 0 for g in direct)
+        forward = [g for g in direct if not g.backward]
+        pointers = [{x.data_ptr() for x in g.output_copy_sources() if x.numel()} for g in forward]
+        assert len(pointers) == 2 and pointers[0] & pointers[1]
+
     finally:
         cg.release_graphs()
         training.cuda_graphs = previous

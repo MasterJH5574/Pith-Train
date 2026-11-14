@@ -545,6 +545,73 @@ def escape_borrowed(outputs, storages):
     return result
 
 
+class GraphPoolStorage:
+    """Non-owning CUDA array view whose graph keeps the private pool alive.
+
+    Used only for scratch outputs copied before the next replay on the same stream. These
+    views must never escape to callers or serve as private saved-tensor loans.
+    """
+
+    def __init__(self, storage, graph):
+        self.graph = graph
+        self.__cuda_array_interface__ = {
+            "shape": (storage.nbytes(),),
+            "typestr": "|u1",
+            "data": (storage.data_ptr(), False),
+            "version": 3,
+        }
+
+
+def nonowning_graph_outputs(outputs, inputs, graph, pool):
+    """Return scratch aliases without keeping each variant's pool allocations live.
+
+    Check allocator ownership before dropping references. Inputs, constants outside this
+    graph pool, and CPU values keep their original ownership. The pool is private, captures
+    and replays use one stream, and the scheduled backend copies all escaping outputs.
+    """
+    segments = torch.cuda.memory_snapshot(mempool_id=pool, include_traces=False)
+    ranges = [
+        (segment["address"], segment["address"] + segment["total_size"])
+        for segment in segments
+        if tuple(segment.get("segment_pool_id", ())) == tuple(pool)
+    ]
+    protected = {x.untyped_storage()._cdata for x in inputs if isinstance(x, torch.Tensor)}
+    storages, objects, result = {}, {}, []
+    released_bytes = 0
+    for out in outputs:
+        if not isinstance(out, torch.Tensor) or not out.is_cuda:
+            result.append(out)
+            continue
+        storage = out.untyped_storage()
+        if (
+            storage._cdata in protected
+            or not storage.nbytes()
+            or not any(
+                start <= storage.data_ptr() and storage.data_ptr() + storage.nbytes() <= end
+                for start, end in ranges
+            )
+        ):
+            result.append(out)
+            continue
+        if id(out) not in objects:
+            if storage._cdata not in storages:
+                raw = torch.as_tensor(GraphPoolStorage(storage, graph), device=out.device)
+                if raw.data_ptr() != storage.data_ptr():
+                    raise RuntimeError("graph scratch alias unexpectedly copied its allocation")
+                storages[storage._cdata] = raw.untyped_storage()
+                released_bytes += storage.nbytes()
+            alias = torch.empty(0, dtype=out.dtype, device=out.device).set_(
+                storages[storage._cdata], out.storage_offset(), out.shape, out.stride()
+            )
+            if out.is_conj():
+                alias = alias.conj()
+            if out.is_neg():
+                alias = torch._neg_view(alias)
+            objects[id(out)] = alias
+        result.append(objects[id(out)])
+    return result, released_bytes
+
+
 def live_graphs():
     graphs[:] = [ref for ref in graphs if ref() is not None]
     return [ref() for ref in graphs]
@@ -627,6 +694,7 @@ def graph_stats() -> dict:
         "capture_seconds": sum(g.capture_seconds for g in live),
         "scheduled_instances": sum(g.graph is not None and bool(g.scheduled_inputs) for g in live),
         "scheduled_direct_replays": sum(g.replays for g in live if g.scheduled_inputs),
+        "nonowning_output_variants": sum(g.nonowning_output_bytes > 0 for g in live),
         "combine_buffer_slots": sum(len(pool.slots) for pool in graph_buffers.pools),
         "combine_buffer_bytes": sum(
             slot.tensor.numel() * slot.tensor.element_size()
@@ -935,6 +1003,7 @@ class StaticGraph:
         self.replays = self.fallbacks = 0
         self.capture_seconds = 0.0
         self.word_input_copies = self.word_output_copies = 0
+        self.nonowning_output_bytes = 0
         self.transfers = None
         self.transfer_replays = 0
         graphs.append(weakref.ref(self))
@@ -1191,6 +1260,17 @@ class StaticGraph:
         # attention's softmax merge) guard that mode, even though the enclosing step enables it.
         with torch.set_grad_enabled(self.grad_enabled), torch.cuda.graph(graph, pool=self.pool):
             self.outputs = self.fn(list(self.inputs))
+        if (
+            self.scheduled_inputs
+            and not self.lease
+            and self.owner is None
+            and self.pool is not None
+        ):
+            # No caller or AOT save receives these scratch views: the replay path copies
+            # every non-input output before another variant can overwrite the shared pool.
+            self.outputs, self.nonowning_output_bytes = nonowning_graph_outputs(
+                self.outputs, self.inputs, graph, self.pool
+            )
         self.describe_outputs()
         output_sources = self.output_copy_sources()
         stream_key = (self.inputs[self.tensor_inputs[0]].device, self.stream)
