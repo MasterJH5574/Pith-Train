@@ -649,6 +649,9 @@ def release_graphs():
     transfer_uploads.clear()
     for graph in live:
         graph.transfers = None
+        for name in tuple(vars(graph)):
+            if name.startswith("scheduled_") and name.endswith("_scratch_inputs"):
+                delattr(graph, name)
         # Allocation or capture failure may leave only some of these buffers initialized.
         for name in (
             "inputs",
@@ -693,6 +696,7 @@ def release_graphs():
         graph.bound.clear()
     for pool in graph_buffers.pools:
         pool.graphs.clear()
+        pool.output_slots.clear()
 
 
 @cache
@@ -715,9 +719,7 @@ def graph_stats() -> dict:
         "scheduled_output_slots": sum(
             g.graph is not None and g.scheduled_output_lease() for g in live
         ),
-        "scheduled_output_replays": sum(
-            g.replays for g in live if g.scheduled_output_lease()
-        ),
+        "scheduled_output_replays": sum(g.replays for g in live if g.scheduled_output_lease()),
         "nonowning_output_variants": sum(g.nonowning_output_bytes > 0 for g in live),
         "combine_buffer_slots": sum(len(pool.slots) for pool in graph_buffers.pools),
         "combine_buffer_bytes": sum(
@@ -1697,7 +1699,9 @@ def graph_backend(gm, example_inputs, *, options, pipeline_outputs=(), scheduled
                 gm,
                 example_inputs,
                 inner_compile=partial(
-                    compile_graph, pipeline_outputs=pipeline_outputs, scheduled_outputs=scheduled_outputs
+                    compile_graph,
+                    pipeline_outputs=pipeline_outputs,
+                    scheduled_outputs=scheduled_outputs,
                 ),
                 config_patches={**options, "triton.cudagraphs": False},
             )
@@ -1780,7 +1784,9 @@ def compile_stage(*, options, pipeline_outputs=(), scheduled_outputs=()):
             fn,
             fullgraph=True,
             backend=partial(
-                graph_backend, options=options, pipeline_outputs=pipeline_outputs,
+                graph_backend,
+                options=options,
+                pipeline_outputs=pipeline_outputs,
                 scheduled_outputs=scheduled_outputs,
             ),
         )

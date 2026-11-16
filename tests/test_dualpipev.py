@@ -368,7 +368,10 @@ def main(model_name: str):
         return chunks
 
     output_leases = (
-        training.cuda_graphs and not training.fp8 and cp_size > 1 and ep_size > 1
+        training.cuda_graphs
+        and not training.fp8
+        and cp_size > 1
+        and ep_size > 1
         and config.model_type == "qwen3_moe"
     )
     # Direct backward saved-input bindings are discovered after forward capture.
@@ -649,8 +652,12 @@ def main(model_name: str):
         stats = graph_stats()
         expected_replays = num_chunks * sum(len(module.layers) for module in local_modules)
         if output_leases and not ragged:
-            assert stats["forward_replays"] - before_replay["forward_replays"] == expected_replays, stats
-            assert stats["backward_replays"] - before_replay["backward_replays"] == expected_replays, stats
+            assert (
+                stats["forward_replays"] - before_replay["forward_replays"] == expected_replays
+            ), stats
+            assert (
+                stats["backward_replays"] - before_replay["backward_replays"] == expected_replays
+            ), stats
             assert stats["scheduled_output_replays"] > 0, stats
         elif not ragged:
             assert stats["forward_replays"] == stats["backward_replays"] == expected_replays, stats

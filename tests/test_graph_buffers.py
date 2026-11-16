@@ -142,11 +142,20 @@ def test_scheduled_graph_inputs_replay_with_two_live_microbatches(lend_outputs):
             assert pool.output_slots
         else:
             assert all(g.nonowning_output_bytes > 0 for g in direct)
-            pointers = [{x.data_ptr() for x in g.output_copy_sources() if x.numel()} for g in forward]
+            pointers = [
+                {x.data_ptr() for x in g.output_copy_sources() if x.numel()} for g in forward
+            ]
             assert len(pointers) == 2 and pointers[0] & pointers[1]
 
     finally:
+        parents = {g.parent for g in pool.graphs.values()}
         cg.release_graphs()
+        assert not pool.output_slots
+        assert not any(
+            name.startswith("scheduled_") and name.endswith("_scratch_inputs")
+            for parent in parents
+            for name in vars(parent)
+        )
         training.cuda_graphs = previous
 
 
