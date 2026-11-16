@@ -1,5 +1,9 @@
 # Where the output-lending copy savings went — 2026-11-16
 
+**Follow-up:** the [Megatron comparison and capacity intervention](cuda-graphs-megatron-memory-20261116.md)
+subsequently completed the pressure probe. High occupancy alone did not reproduce the stalls;
+that report refines the pool-layout explanation and includes the previously missing CP-rank asymmetry.
+
 The output-lending implementation removes substantial GPU copy traffic, but its retained graph
 pools introduce allocation pressure and distributed stalls. In a controlled same-node profile,
 copying falls by **110.30 ms**, while the whole step becomes **69.78 ms slower**. This report
