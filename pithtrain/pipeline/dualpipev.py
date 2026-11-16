@@ -572,7 +572,7 @@ class DualPipeV(nn.Module):
                     ) + len(self.module[1].layers) * (distributed.pp_rank + 1)
                     # One spare preserves the forward-combine/backward-read overlap when
                     # the live activation bound is reached. Retired slots remain event-ordered.
-                    self.combine_graph_buffers = CombineBufferPool(bound + 1)
+                    self.combine_graph_buffers = CombineBufferPool(bound + 1, lend_outputs=True)
                 with scheduled_graph_buffers(self.combine_graph_buffers):
                     return self.guard_skip.run(
                         self, microbatches, self.run_step, microbatches, objective

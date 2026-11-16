@@ -367,7 +367,12 @@ def main(model_name: str):
             chunks.append((chunk_x, chunk_l, chunk_cu))
         return chunks
 
-    chunk_steps = [build_chunks(0), build_chunks(1)]
+    output_leases = (
+        training.cuda_graphs and not training.fp8 and cp_size > 1 and ep_size > 1
+        and config.model_type == "qwen3_moe"
+    )
+    # Direct backward saved-input bindings are discovered after forward capture.
+    chunk_steps = [build_chunks(i) for i in range(3 if output_leases else 2)]
 
     # The reference runs single-device and full-sequence (pp=ep=cp=1); restored before DualPipeV.
     # cp_rank is forced too: forward_posemb reads it unguarded, so a nonzero cp_rank would give the
@@ -497,6 +502,10 @@ def main(model_name: str):
         # Count the executed scheduler entry instead of inferring it from model adjacency.
         from pithtrain.pipeline import dualpipev as scheduler
 
+        if output_leases:
+            from pithtrain.pipeline.cuda_graphs import graph_stats
+
+            before_replay = graph_stats()
         with patch.object(scheduler, "stage5_stage1_f", wraps=scheduler.stage5_stage1_f) as merged:
             objective_outputs = dualpipev_model.step(microbatches, checked_objective)
             merged_stage_calls.append(merged.call_count)
@@ -639,7 +648,11 @@ def main(model_name: str):
 
         stats = graph_stats()
         expected_replays = num_chunks * sum(len(module.layers) for module in local_modules)
-        if not ragged:
+        if output_leases and not ragged:
+            assert stats["forward_replays"] - before_replay["forward_replays"] == expected_replays, stats
+            assert stats["backward_replays"] - before_replay["backward_replays"] == expected_replays, stats
+            assert stats["scheduled_output_replays"] > 0, stats
+        elif not ragged:
             assert stats["forward_replays"] == stats["backward_replays"] == expected_replays, stats
         else:
             assert stats["forward_replays"] > 0 and stats["backward_replays"] > 0, stats

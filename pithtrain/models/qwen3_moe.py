@@ -340,7 +340,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
             outs = self.forward_stage5_stage1_compute(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
         return self.stage1_dispatch(*outs)
 
-    @compile_stage(options={"cpp_wrapper": True, **stage_compile_options()})
+    # The loss scalar escapes until end-of-step logging; only the four pipeline
+    # outputs below retire with the combine slot. Private AOT saves retire there too.
+    @compile_stage(
+        options={"cpp_wrapper": True, **stage_compile_options()}, scheduled_outputs=(0, 1, 2, 3)
+    )
     def forward_stage5_stage1_compute(
         self,
         prev_layer: "Qwen3MoeDecoderLayer",

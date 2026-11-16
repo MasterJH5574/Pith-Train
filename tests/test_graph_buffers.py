@@ -74,7 +74,8 @@ def test_combine_slot_reuse_orders_different_streams():
     torch.testing.assert_close(reused, torch.full_like(reused, 13))
 
 
-def test_scheduled_graph_inputs_replay_with_two_live_microbatches():
+@pytest.mark.parametrize("lend_outputs", [False, True])
+def test_scheduled_graph_inputs_replay_with_two_live_microbatches(lend_outputs):
     from pithtrain.pipeline import cuda_graphs as cg
     from pithtrain.pipeline.graph_buffers import (
         CombineBufferPool,
@@ -83,9 +84,9 @@ def test_scheduled_graph_inputs_replay_with_two_live_microbatches():
     )
 
     cg.release_graphs()
-    pool = CombineBufferPool(2)
+    pool = CombineBufferPool(2, lend_outputs=lend_outputs)
 
-    @cg.compile_stage(options={})
+    @cg.compile_stage(options={}, scheduled_outputs=(0,))
     def compute(x, weight):
         return (x @ weight).sin()
 
@@ -121,7 +122,8 @@ def test_scheduled_graph_inputs_replay_with_two_live_microbatches():
                     expected_grad.add_(ref_w.grad)
                     pool.release(inputs[index])
                 torch.testing.assert_close(weight.grad, expected_grad)
-                escaped.extend((y, y.detach().clone()) for y in outputs)
+                if not lend_outputs:
+                    escaped.extend((y, y.detach().clone()) for y in outputs)
                 with torch.no_grad():
                     weight.add_(0.001)
             for value, snapshot in escaped:
@@ -131,10 +133,17 @@ def test_scheduled_graph_inputs_replay_with_two_live_microbatches():
         assert any(g.backward and g.replays for g in direct)
         for graph in direct:
             assert set(graph.scheduled_inputs).isdisjoint(i for i, _ in graph.copy_sources)
-        assert all(g.nonowning_output_bytes > 0 for g in direct)
         forward = [g for g in direct if not g.backward]
-        pointers = [{x.data_ptr() for x in g.output_copy_sources() if x.numel()} for g in forward]
-        assert len(pointers) == 2 and pointers[0] & pointers[1]
+        if lend_outputs:
+            assert all(g.borrowed_outputs and not g.escaping_copies for g in forward)
+            assert all(g.word_output_copies == 0 for g in forward)
+            pointers = [{g.outputs[i].data_ptr() for i in g.borrowed_outputs} for g in forward]
+            assert len(pointers) == 2 and not pointers[0] & pointers[1]
+            assert pool.output_slots
+        else:
+            assert all(g.nonowning_output_bytes > 0 for g in direct)
+            pointers = [{x.data_ptr() for x in g.output_copy_sources() if x.numel()} for g in forward]
+            assert len(pointers) == 2 and pointers[0] & pointers[1]
 
     finally:
         cg.release_graphs()
@@ -261,3 +270,89 @@ def test_nonowning_outputs_preserve_aliases_with_delayed_auxiliary_stream():
         torch.testing.assert_close(outputs[3], source)
     torch.testing.assert_close(saved_again, torch.full_like(saved_again, 7))
     del pressure
+
+
+def test_output_lease_keeps_original_lifetime_when_consumed_by_next_slot():
+    from pithtrain.contexts import training
+    from pithtrain.pipeline import cuda_graphs as cg
+    from pithtrain.pipeline.graph_buffers import (
+        CombineBufferPool,
+        detach_combine_buffer,
+        scheduled_graph_buffers,
+    )
+
+    cg.release_graphs()
+    pool = CombineBufferPool(2, lend_outputs=True)
+
+    @cg.compile_stage(options={}, scheduled_outputs=(0,))
+    def compute(x, residual):
+        return x.sin() + residual.square()
+
+    previous = training.cuda_graphs
+    training.cuda_graphs = True
+    try:
+        for _ in range(4):
+            with scheduled_graph_buffers(pool):
+                cg.capture_pending()
+                a = pool.acquire(torch.empty(4, 8, device="cuda"), 4, torch.cuda.current_stream())
+                b = pool.acquire(a, 4, torch.cuda.current_stream())
+                a.normal_()
+                b.normal_()
+                a, b = detach_combine_buffer(a), detach_combine_buffer(b)
+                ra = a.detach().clone().requires_grad_()
+                rb = b.detach().clone().requires_grad_()
+                residual = torch.ones_like(a)
+                first = compute(a, residual)
+                second = compute(b, first)
+                reference = rb.sin() + (ra.sin() + residual.square()).square()
+                torch.testing.assert_close(second, reference)
+                second.sum().backward()
+                reference.sum().backward()
+                torch.testing.assert_close(a.grad, ra.grad)
+                torch.testing.assert_close(b.grad, rb.grad)
+                pool.release(b)
+                pool.release(a)
+        assert any(g.scheduled_output_lease() and g.replays for g in pool.graphs.values())
+    finally:
+        cg.release_graphs()
+        training.cuda_graphs = previous
+
+
+def test_unleased_metric_survives_output_slot_reuse():
+    from pithtrain.contexts import training
+    from pithtrain.pipeline import cuda_graphs as cg
+    from pithtrain.pipeline.graph_buffers import (
+        CombineBufferPool,
+        detach_combine_buffer,
+        scheduled_graph_buffers,
+    )
+
+    cg.release_graphs()
+    pool = CombineBufferPool(1, lend_outputs=True)
+
+    @cg.compile_stage(options={}, scheduled_outputs=(0,))
+    def compute(x):
+        return x.sin(), x.square().mean()
+
+    previous = training.cuda_graphs
+    training.cuda_graphs = True
+    metrics = []
+    try:
+        for step in range(4):
+            with scheduled_graph_buffers(pool):
+                cg.capture_pending()
+                x = pool.acquire(torch.empty(4, 8, device="cuda"), 4, torch.cuda.current_stream())
+                x.fill_(step + 1)
+                x = detach_combine_buffer(x)
+                y, metric = compute(x)
+                metrics.append((metric.detach(), float((step + 1) ** 2)))
+                y.sum().backward()
+                torch.testing.assert_close(x.grad, x.detach().cos())
+                pool.release(x)
+            for metric, expected in metrics:
+                torch.testing.assert_close(metric, torch.full_like(metric, expected))
+        forward = [g for g in pool.graphs.values() if not g.backward and g.graph is not None]
+        assert forward and all(g.borrowed_outputs and g.escaping_copies for g in forward)
+    finally:
+        cg.release_graphs()
+        training.cuda_graphs = previous

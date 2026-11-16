@@ -30,8 +30,10 @@ class CombineLease:
 
 
 class CombineBufferPool:
-    def __init__(self, max_slots):
+    def __init__(self, max_slots, *, lend_outputs=False):
         self.max_slots = max_slots
+        self.lend_outputs = lend_outputs
+        self.output_slots = {}
         self.shape_key = None
         self.slots = []
         self.available = deque()
@@ -88,10 +90,25 @@ class CombineBufferPool:
         self.available.append(slot)
         self.live -= 1
 
-    def binding(self, value):
+    def register_outputs(self, outputs, slots):
+        """Keep graph-produced saves tied to their original combine lifetime."""
+        unique = {id(slot): slot for slot in slots}
+        if len(unique) != 1:
+            raise RuntimeError("graph outputs require one combine-buffer lifetime")
+        slot = next(iter(unique.values()))
+        for value in outputs:
+            key = value.untyped_storage()._cdata
+            prior = self.output_slots.setdefault(key, slot)
+            if prior is not slot:
+                raise RuntimeError("graph output storage overlaps another live slot")
+
+    def binding(self, value, *, include_outputs=True):
         if not isinstance(value, torch.Tensor) or not value.is_cuda:
             return None
-        slot = self.by_storage.get(value.untyped_storage()._cdata)
+        key = value.untyped_storage()._cdata
+        slot = self.by_storage.get(key)
+        if slot is None and include_outputs:
+            slot = self.output_slots.get(key)
         if slot is None or slot.lease is None or value.is_conj() or value.is_neg():
             return None
         return slot

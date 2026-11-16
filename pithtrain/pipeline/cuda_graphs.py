@@ -712,6 +712,12 @@ def graph_stats() -> dict:
         "capture_seconds": sum(g.capture_seconds for g in live),
         "scheduled_instances": sum(g.graph is not None and bool(g.scheduled_inputs) for g in live),
         "scheduled_direct_replays": sum(g.replays for g in live if g.scheduled_inputs),
+        "scheduled_output_slots": sum(
+            g.graph is not None and g.scheduled_output_lease() for g in live
+        ),
+        "scheduled_output_replays": sum(
+            g.replays for g in live if g.scheduled_output_lease()
+        ),
         "nonowning_output_variants": sum(g.nonowning_output_bytes > 0 for g in live),
         "combine_buffer_slots": sum(len(pool.slots) for pool in graph_buffers.pools),
         "combine_buffer_bytes": sum(
@@ -987,6 +993,7 @@ class StaticGraph:
         saved_from=None,
         pipeline_outputs=(),
         retained_inputs=(),
+        scheduled_outputs=(),
         scheduled_inputs=None,
         scheduled_pool=None,
     ):
@@ -997,6 +1004,7 @@ class StaticGraph:
         self.saved_outputs = tuple(saved_outputs)
         self.pipeline_outputs = tuple(pipeline_outputs)
         self.retained_inputs = tuple(retained_inputs)
+        self.scheduled_outputs = tuple(scheduled_outputs)
         self.scheduled_inputs = scheduled_inputs or {}
         self.scheduled_pool = weakref.ref(scheduled_pool) if scheduled_pool is not None else None
         self.scheduled_input_keys = {}
@@ -1156,7 +1164,7 @@ class StaticGraph:
         parent = self.parent
         self.map_saved_inputs(args)
         prefix = (
-            "scheduled_"
+            "scheduled_" + "_".join(map(str, self.scheduled_inputs)) + "_"
             if self.scheduled_inputs
             else "saved_retained_"
             if self.saved_from is not None and self.saved_from.retained_inputs
@@ -1281,6 +1289,7 @@ class StaticGraph:
         if (
             self.scheduled_inputs
             and not self.lease
+            and not self.scheduled_output_lease()
             and self.owner is None
             and self.pool is not None
         ):
@@ -1321,6 +1330,10 @@ class StaticGraph:
         self.graph = graph
         self.capture_seconds += time.perf_counter() - start
 
+    def scheduled_output_lease(self):
+        pool = self.scheduled_pool() if self.scheduled_pool is not None else None
+        return pool is not None and pool.lend_outputs and not self.backward
+
     def output_copy_sources(self):
         # The probe's indices describe the compiled output ABI; final captured Tensor objects
         # replace probe objects before any backward binds private saved inputs.
@@ -1337,6 +1350,14 @@ class StaticGraph:
         self.borrowed_outputs = (
             self.lease_outputs(self.outputs, self.inputs) if self.lease else set()
         )
+        if self.scheduled_output_lease():
+            self.borrowed_outputs = private_outputs(
+                self.outputs, self.inputs, self.saved_outputs + self.scheduled_outputs
+            )
+            self.scheduled_pool().register_outputs(
+                [self.outputs[i] for i in self.borrowed_outputs],
+                self.scheduled_inputs.values(),
+            )
         self.retained_saved_outputs = self.retained_saves(self.outputs, self.inputs)
         self.output_specs = []
         self.output_repeats = {}
@@ -1441,7 +1462,8 @@ class StaticGraph:
             bindings = {
                 i: slot
                 for i in self.read_inputs
-                if i not in self.mutated_inputs and (slot := pool.binding(args[i])) is not None
+                if i not in self.mutated_inputs
+                and (slot := pool.binding(args[i], include_outputs=self.backward)) is not None
             }
             if bindings:
                 key = (self, tuple((i, tensor_view_key(args[i])) for i in bindings))
@@ -1456,11 +1478,16 @@ class StaticGraph:
                         self.mutated_inputs,
                         self.backward,
                         parent=self,
+                        saved_outputs=self.saved_outputs,
+                        scheduled_outputs=self.scheduled_outputs,
                         scheduled_inputs=bindings,
                         scheduled_pool=pool,
                     )
-                    # No graph-owned result escapes: outputs/saves are copied before the
-                    # next replay. These variants can reuse their parent's temporary arena.
+                    if pool.lend_outputs and not self.backward:
+                        # Independent arenas prevent another slot's temporary allocations
+                        # overwriting live outputs. Bound by the scheduler slot count.
+                        child.pool = torch.cuda.graph_pool_handle()
+                    # Backward results still escape by copy; its temporary arena is shared.
                     pool.graphs[key] = child
                 return child(args)
         if self.owner is None and active_owner is not None:
@@ -1539,7 +1566,7 @@ class StaticGraph:
         for i, (alias, meta, dims, out) in enumerate(self.output_specs):
             if i in self.borrowed_outputs:
                 value = self.outputs[i]
-                if self.pipeline_outputs:
+                if self.pipeline_outputs or self.scheduled_output_lease():
                     # AOT attaches public autograd metadata. Keep graph-owned Tensor objects
                     # untouched and preserve repeated-object aliases within this invocation.
                     if id(value) not in borrowed_objects:
@@ -1600,7 +1627,7 @@ class StaticGraph:
         return result
 
 
-def compile_graph(gm, example_inputs, *, pipeline_outputs=(), **kwargs):
+def compile_graph(gm, example_inputs, *, pipeline_outputs=(), scheduled_outputs=(), **kwargs):
     from torch._inductor.compile_fx import compile_fx_inner
     from torch._inductor.output_code import CompiledFxGraph
 
@@ -1613,6 +1640,7 @@ def compile_graph(gm, example_inputs, *, pipeline_outputs=(), **kwargs):
     visible = output.meta.get("user_visible_output_idxs")
     saved_outputs = ()
     leased_outputs = ()
+    scheduled_leased_outputs = ()
     context = torch._guards.TracingContext.try_get()
     metadata = context.fw_metadata if context is not None else None
     boundary = getattr(metadata, "num_forward", None)
@@ -1632,6 +1660,9 @@ def compile_graph(gm, example_inputs, *, pipeline_outputs=(), **kwargs):
         proposed = tuple(offset + i for i in pipeline_outputs)
         if proposed and all(i in visible for i in proposed):
             leased_outputs = proposed
+        proposed = tuple(offset + i for i in scheduled_outputs)
+        if proposed and all(i in visible for i in proposed):
+            scheduled_leased_outputs = proposed
     compiled = compile_fx_inner(gm, example_inputs, **kwargs)
     if isinstance(compiled, CompiledFxGraph):
         compiled.current_callable = StaticGraph(
@@ -1641,11 +1672,12 @@ def compile_graph(gm, example_inputs, *, pipeline_outputs=(), **kwargs):
             kwargs.get("is_backward", False),
             saved_outputs=saved_outputs,
             pipeline_outputs=leased_outputs,
+            scheduled_outputs=scheduled_leased_outputs,
         )
     return compiled
 
 
-def graph_backend(gm, example_inputs, *, options, pipeline_outputs=()):
+def graph_backend(gm, example_inputs, *, options, pipeline_outputs=(), scheduled_outputs=()):
     from torch._functorch import config as aot_config
     from torch._inductor.compile_fx import compile_fx
 
@@ -1664,7 +1696,9 @@ def graph_backend(gm, example_inputs, *, options, pipeline_outputs=()):
             return compile_fx(
                 gm,
                 example_inputs,
-                inner_compile=partial(compile_graph, pipeline_outputs=pipeline_outputs),
+                inner_compile=partial(
+                    compile_graph, pipeline_outputs=pipeline_outputs, scheduled_outputs=scheduled_outputs
+                ),
                 config_patches={**options, "triton.cudagraphs": False},
             )
     finally:
@@ -1731,7 +1765,7 @@ def install_lazy_kernel_metadata_fix():
     triton_lazy_compile.run_triton_kernel_with_autotune = resolve
 
 
-def compile_stage(*, options, pipeline_outputs=()):
+def compile_stage(*, options, pipeline_outputs=(), scheduled_outputs=()):
     """Compile with the model's options, selecting scratch replay only when requested."""
 
     def decorate(fn):
@@ -1745,7 +1779,10 @@ def compile_stage(*, options, pipeline_outputs=()):
         captured = torch.compile(
             fn,
             fullgraph=True,
-            backend=partial(graph_backend, options=options, pipeline_outputs=pipeline_outputs),
+            backend=partial(
+                graph_backend, options=options, pipeline_outputs=pipeline_outputs,
+                scheduled_outputs=scheduled_outputs,
+            ),
         )
 
         @wraps(fn)
