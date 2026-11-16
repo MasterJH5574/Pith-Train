@@ -1,5 +1,10 @@
 # CUDA graphs for training
 
+Follow-up: [scheduled output reuse, 2026-11-16](cuda-graphs-output-leases-20261116.md)
+implements forward output borrowing and direct backward saved inputs. The repeated S8192 trial
+passes its real-routing correctness check but loses 4.5% throughput versus graphs disabled and
+has inadequate memory headroom. It remains a research branch.
+
 ## Consolidated investigation — 2026-11-14
 
 **Research result: graph capture works for Qwen3 and GPT-OSS, but a general throughput improvement
