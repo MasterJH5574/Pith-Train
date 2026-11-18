@@ -215,6 +215,12 @@ class TrainingCfg(SlottedDefault):
     Train the linear layers in FP8 through DeepGEMM with 128-element block scaling; False is BF16.
     """
 
+    cuda_graphs: bool = False
+    """
+    Replay each layer's stage 1 forward and backward from CUDA graphs (Qwen3 MoE and GPT-OSS,
+    BF16). Dispatch, experts, aggregation and FSDP stay ordinary. See docs/cuda-graphs.md.
+    """
+
     init_std: float = 0.02
 
     nsys_start: Optional[int] = None
@@ -357,6 +363,7 @@ def setup_model(
     distributed_cfg: DistributedCfg,
 ) -> None:
     training.fp8 = cfg.fp8
+    training.cuda_graphs = cfg.cuda_graphs
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
 
@@ -365,6 +372,10 @@ def setup_model(
 
     modules = []
     module_config = AutoConfig.from_pretrained(cfg.model)
+    if cfg.cuda_graphs and module_config.model_type not in ("qwen3_moe", "gpt_oss"):
+        raise ValueError("cuda_graphs currently supports only Qwen3 MoE and GPT-OSS")
+    if cfg.cuda_graphs and cfg.fp8:
+        raise ValueError("cuda_graphs currently supports only BF16 training")
     module_config.max_position_embeddings = cfg.sequence_length
 
     assert hasattr(module_config, "hidden_size")

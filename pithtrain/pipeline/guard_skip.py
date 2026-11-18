@@ -162,6 +162,7 @@ class GuardSkip:
             ambient_state(),
             modes,
             training.fp8,
+            training.cuda_graphs,
             distributed.ep_size,
             distributed.cp_size,
             distributed.pp_size,

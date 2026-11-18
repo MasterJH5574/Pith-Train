@@ -33,6 +33,7 @@ from pithtrain.operators.token_scatter import (
     precompute_group_indices,
     scatter_for_grouped_gemm,
 )
+from pithtrain.pipeline.cuda_graphs import compile_stage
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
 
@@ -239,7 +240,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    @torch.compile(fullgraph=True, options={"cpp_wrapper": True, **stage_compile_options()})
+    @compile_stage(options={"cpp_wrapper": True, **stage_compile_options()})
     def forward_stage1_compute(
         self,
         hidden_states: torch.Tensor,
@@ -289,9 +290,16 @@ class Qwen3MoeDecoderLayer(nn.Module):
         """
         prev_layer.forward_stage5 then self.forward_stage1 as one compiled region, so each layer
         and micro-batch enters one compiled graph (and one compiled backward) instead of two.
+        With CUDA graphs, capture only stage 1 to avoid copying the larger expert-output buffers.
         """
         replay_idx = replay_indices(self.mlp.gate, residual, self.mlp.num_experts_per_tok)
-        outs = self.forward_stage5_stage1_compute(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
+        if training.cuda_graphs and torch.is_grad_enabled():
+            # Preserve the fused path's FSDP scheduling. Bypass the previous layer's registered
+            # forward_stage5 wrapper: aggregation reads no parameters.
+            hidden_states = Qwen3MoeDecoderLayer.forward_stage5(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual)  # fmt: skip
+            outs = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens, replay_idx)
+        else:
+            outs = self.forward_stage5_stage1_compute(prev_layer, moe_outs, moe_local_idxs, topk_weight, residual, rotary_posemb, cu_seqlens, replay_idx)  # fmt: skip
         return self.stage1_dispatch(*outs)
 
     @torch.compile(fullgraph=True, options={"cpp_wrapper": True, **stage_compile_options()})

@@ -227,9 +227,10 @@ def memoized_launch(kind: str, inputs: Dict[str, Optional[torch.Tensor]], scalar
     recording exists (FA4 only allocated, took views and called compiled kernels) later calls
     allocate the same buffers afresh and call the same kernels on the live inputs. The outputs are
     entry()'s (bit for bit where FA4 is deterministic). With any FA4 version other than the
-    validated one, every call is entry().
+    validated one, every call is entry(). During CUDA graph capture, entry() resolves the capture
+    stream afresh, without reading or changing plans recorded on an ordinary execution stream.
     """
-    if not FAST_PATH:
+    if not FAST_PATH or torch.cuda.is_current_stream_capturing():
         return entry()
     key = signature(kind, inputs, *scalars)
     plan = plans.get(key, MISSING)

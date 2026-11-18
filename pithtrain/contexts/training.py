@@ -39,6 +39,11 @@ This and the two class bindings below are read by models and operators that hold
 object, so they live here rather than being passed down.
 """
 
+cuda_graphs: bool = False
+"""
+Capture supported models' static forward/backward compute; selected by TrainingCfg at setup.
+"""
+
 
 Linear: type[linear.BF16Linear | linear.FP8Linear]
 

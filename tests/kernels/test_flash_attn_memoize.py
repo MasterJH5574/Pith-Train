@@ -244,3 +244,37 @@ def test_unseen_signature_calls_entry():
     (o, lse), num_entry_calls = memo_fwd(q2, k2, v2, None, scale * 0.5, causal, (None, None))
     assert num_entry_calls == 1
     assert torch.equal(o, fwd_entry(q2, k2, v2, None, scale * 0.5, causal, (None, None))()[0])
+
+
+def test_capture_uses_current_stream_and_preserves_host_plan():
+    q, k, v, do, sink, scale, causal, window = make("qwen3-gqa", 10)
+    for _ in range(4):
+        (o, lse), fwd_calls = memo_fwd(q, k, v, sink, scale, causal, window)
+        grads, bwd_calls = memo_bwd(q, k, v, o, lse, do, sink, scale, causal, window)
+    if fa4_memoized():
+        assert (fwd_calls, bwd_calls) == (0, 0)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+        (o, lse), fwd_calls = memo_fwd(q, k, v, sink, scale, causal, window)
+        grads, bwd_calls = memo_bwd(q, k, v, o, lse, do, sink, scale, causal, window)
+    assert (fwd_calls, bwd_calls) == (1, 1)
+    for seed in (11, 12):
+        fresh = make("qwen3-gqa", seed)
+        for dst, src in zip((q, k, v, do), fresh[:4]):
+            dst.copy_(src)
+        for tensor in (o, lse, *grads):
+            tensor.fill_(float("nan"))
+        graph.replay()
+        ref_o, ref_lse = fwd_entry(q, k, v, sink, scale, causal, window)()
+        ref_grads = bwd_entry(q, k, v, ref_o, ref_lse, do, sink, scale, causal, window)()
+        assert torch.equal(o, ref_o) and torch.equal(lse, ref_lse)
+        for got, want in zip(grads, ref_grads):
+            ulp = torch.finfo(torch.bfloat16).eps * torch.maximum(
+                got.float().abs(), want.float().abs()
+            )
+            assert ((got.float() - want.float()).abs() <= 4 * ulp + 1e-6).all()
+        _, fwd_calls = memo_fwd(q, k, v, sink, scale, causal, window)
+        _, bwd_calls = memo_bwd(q, k, v, ref_o, ref_lse, do, sink, scale, causal, window)
+        if fa4_memoized():
+            assert (fwd_calls, bwd_calls) == (0, 0)
