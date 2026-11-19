@@ -36,6 +36,7 @@ from pithtrain.modules.wgrad_accumulation import install_raw_main_grad, install_
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear, FP8Linear
 from pithtrain.pipeline import DualPipeV
+from pithtrain.pipeline.dense_zero3 import DenseZero3DualPipeV, is_dense
 
 from .distributed import DistributedCfg
 
@@ -433,7 +434,17 @@ def setup_model(
                 layer = int(name.split("layers.")[1].split(".")[0])
                 module.router_replay = imbalance.replay(module.num_experts, layer)
 
-    training.model = DualPipeV(modules)
+    if is_dense(modules):
+        # Without experts to shard by expert parallelism, a dense model's layers are sharded per
+        # use (ZeRO-3); see DenseZero3DualPipeV.
+        if cfg.fp8:
+            # The step-level FP8 weight cache would keep a quantized copy of every layer.
+            raise ValueError("dense models do not support fp8 yet")
+        if distributed_cfg.hsdp_replica > 1:
+            raise ValueError("dense models do not support hsdp_replica > 1 yet")
+        training.model = DenseZero3DualPipeV(modules)
+    else:
+        training.model = DualPipeV(modules)
 
 
 offloaded_state: list[tuple[torch.UntypedStorage, torch.Tensor]] = []
