@@ -254,7 +254,11 @@ def apply_fsdp(model, dtype):
     return model
 
 
-def main(model_name: str):
+def main(model_name: str, make_engine=DualPipeV):
+    """
+    make_engine builds the pipeline engine from the stage modules (DualPipeV, or a variant under
+    test, e.g. tests/test_dense_zero3.py).
+    """
     dp_size, pp_size, ep_size = distributed.dp_size, distributed.pp_size, distributed.ep_size
     cp_size, cp_rank = distributed.cp_size, distributed.cp_rank
     pp_rank, dp_rank, ep_rank = distributed.pp_rank, distributed.dp_rank, distributed.ep_rank
@@ -433,7 +437,7 @@ def main(model_name: str):
     install_wgrad_accumulation(local_modules)
     install_raw_main_grad(local_modules)
 
-    dualpipev_model = DualPipeV(local_modules)
+    dualpipev_model = make_engine(local_modules)
 
     def shard(x: torch.Tensor, cu_seqlens: torch.Tensor | None) -> torch.Tensor:
         # A packed sample is sharded one document at a time; cu_seqlens stays the whole sample's.

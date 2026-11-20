@@ -19,7 +19,7 @@ from pithtrain.kernels import (
     fp8_quant_weight,
 )
 
-__all__ = ["BF16Linear", "BF16LinearFunc", "FP8Linear"]
+__all__ = ["BF16AssignLinear", "BF16Linear", "BF16LinearFunc", "FP8Linear"]
 
 
 @torch.library.custom_op("pithtrain::fp8_linear_fwd", mutates_args=())
@@ -249,6 +249,24 @@ def lower_wgrad_accumulate(main_grad: Any, a: Any, b: Any) -> None:
     addmm_dtype_out_fallback(main_grad, a, b, torch.float32, beta=1, alpha=1, out=main_grad)
 
 
+# The same GEMM with beta 0: it overwrites main_grad without reading it, for a caller that
+# allocates main_grad uninitialized for exactly one weight gradient (BF16AssignLinear).
+wgrad_accumulate_library.define("wgrad_assign_(Tensor(a!) main_grad, Tensor a, Tensor b) -> ()")
+
+
+def wgrad_assign_cuda(main_grad: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> None:
+    torch.addmm(main_grad, a, b, beta=0, out_dtype=torch.float32, out=main_grad)
+
+
+wgrad_accumulate_library.impl("wgrad_assign_", wgrad_assign_cuda, "CUDA")
+wgrad_accumulate_library.impl("wgrad_assign_", wgrad_accumulate_meta, "Meta")
+
+
+@register_lowering(torch.ops.pithtrain.wgrad_assign_.default, type_promotion_kind=None)
+def lower_wgrad_assign(main_grad: Any, a: Any, b: Any) -> None:
+    addmm_dtype_out_fallback(main_grad, a, b, torch.float32, beta=0, alpha=1, out=main_grad)
+
+
 class BF16LinearFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -290,4 +308,31 @@ class BF16Linear(nn.Linear):
         if self.main_grad is None or not torch.is_grad_enabled():
             return F.linear(input, self.weight, self.bias)
         output = BF16LinearFunc.apply(input, self.weight, self.main_grad)
+        return output if self.bias is None else output + self.bias
+
+
+class BF16AssignLinearFunc(BF16LinearFunc):
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> Tuple[torch.Tensor, None, None]:
+        input, weight = ctx.saved_tensors
+        grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
+        input_2d = input.reshape(-1, input.shape[-1])
+        grad_input = (grad_output_2d @ weight).view(*input.shape)
+        torch.ops.pithtrain.wgrad_assign_(ctx.main_grad, grad_output_2d.t(), input_2d)
+        return grad_input, None, None
+
+
+class BF16AssignLinear(BF16Linear):
+    """
+    BF16Linear whose weight gradient overwrites main_grad instead of adding to it, for an owner
+    that allocates main_grad uninitialized before each backward and reduces it right after. The
+    layer must then run once per forward of that backward, as DenseZero3DualPipeV's layers do.
+    """
+
+    def forward(self, input: torch.Tensor, quantized_input: None = None) -> torch.Tensor:
+        if self.main_grad is None or not torch.is_grad_enabled():
+            return F.linear(input, self.weight, self.bias)
+        output = BF16AssignLinearFunc.apply(input, self.weight, self.main_grad)
         return output if self.bias is None else output + self.bias
