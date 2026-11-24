@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import math
 import random
+import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Literal, Optional
+from typing import Callable, Iterator, Literal, Optional
 
 import numpy as np
 import torch
@@ -18,7 +20,7 @@ from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
-from pithtrain.contexts import distributed, training
+from pithtrain.contexts import distributed, logging, training
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
@@ -48,6 +50,8 @@ __all__ = [
     "make_wsd_scheduler",
     "make_constant_scheduler",
     "init_weights",
+    "parameters_on_meta",
+    "materialize",
     "apply_fsdp",
     "setup_model",
     "offload_training_state",
@@ -285,6 +289,81 @@ def weight_generator(seed: int, name: str, device: torch.device, *index: int) ->
     return torch.Generator(device=device).manual_seed(int(state))
 
 
+def log_setup(message: str) -> None:
+    """
+    Log on rank 0, when the stdout logger is set up (tests may build a model without it).
+    """
+    stdout = getattr(logging, "stdout", None)
+    if stdout is not None:
+        stdout.info("Setup model: %s" % message)
+
+
+@contextmanager
+def setup_phase(name: str) -> Iterator[None]:
+    """
+    Log a model setup phase with its wall time, so a launch log shows where startup goes.
+    """
+    log_setup(name)
+    t0 = time.monotonic()
+    yield
+    log_setup("%s done in %.1fs" % (name, time.monotonic() - t0))
+
+
+@contextmanager
+def parameters_on_meta() -> Iterator[None]:
+    """
+    Construct modules with every parameter on the meta device and every buffer as usual.
+
+    For a model whose parameters a checkpoint load overwrites: nothing is allocated or initialized
+    for them. A constructor's parameter tensor is swapped for a meta one as it is registered, so
+    the default init that follows, such as nn.Linear's, runs on meta and costs nothing. Buffers are
+    not in a checkpoint, so they are computed exactly as without this context: the rotary caches
+    stay real, and materialize keeps them. This is accelerate's init_empty_weights with
+    include_buffers=False.
+    """
+    register = nn.Module.register_parameter
+
+    def register_on_meta(module: nn.Module, name: str, param: Optional[nn.Parameter]) -> None:
+        if param is not None and not param.is_meta:
+            meta = type(param)(param.to("meta"), requires_grad=param.requires_grad)
+            meta.__dict__.update(param.__dict__)
+            param = meta
+        register(module, name, param)
+
+    nn.Module.register_parameter = register_on_meta
+    try:
+        yield
+    finally:
+        nn.Module.register_parameter = register
+
+
+def materialize(model: nn.Module, device: torch.device) -> None:
+    """
+    Allocate the meta parameters of a model sharded by apply_fsdp on device, uninitialized.
+
+    to_empty reallocates every tensor, and FSDP re-registers each sharded parameter after it. The
+    buffers, already real, are put back as they were. Afterwards no parameter or buffer may be left
+    on meta; the parameters hold garbage until load_checkpoint overwrites them all.
+    """
+    buffers = [
+        (module, name, buffer)
+        for module in model.modules()
+        for name, buffer in module._buffers.items()
+        if buffer is not None
+    ]
+    model.to_empty(device=device)
+    for module, name, buffer in buffers:
+        module._buffers[name] = buffer
+
+    def is_meta(tensor: torch.Tensor) -> bool:
+        return (tensor.to_local() if isinstance(tensor, DTensor) else tensor).is_meta
+
+    left = [name for name, tensor in model.named_parameters() if is_meta(tensor)]
+    left += [name for name, tensor in model.named_buffers() if is_meta(tensor)]
+    if left:
+        raise RuntimeError("materialize left %d tensors on meta, e.g. %s" % (len(left), left[:5]))
+
+
 def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
     """
     The (replica, shard) layout FSDP2 reads as replicate-then-shard; each shard group is a
@@ -295,11 +374,14 @@ def split_replicas(mesh: DeviceMesh, hsdp_replica: int) -> DeviceMesh:
     return mesh._unflatten(0, (hsdp_replica, size // hsdp_replica), ("replica", "shard"))
 
 
-def apply_fsdp(model, hsdp_replica: int = 1):
+def apply_fsdp(model, hsdp_replica: int = 1, init_device: Optional[torch.device] = None):
     """
     Shard the two V-chunks in model with FSDP2 in place and return model. The routed expert
     weights shard over the dp axis of the expert mesh, everything else over the dp x cp stage, and
     gradients reduce as a plain sum. Under FP8 the FP8 weights are all-gathered in FP8.
+
+    A model built under parameters_on_meta needs init_device: its sharded parameters are
+    materialized there, uninitialized, before anything that allocates by them.
     """
     expt_fsdp_mesh = distributed.expt_mesh["dp"]
     if hsdp_replica > 1:
@@ -341,6 +423,10 @@ def apply_fsdp(model, hsdp_replica: int = 1):
             register_fsdp_forward_method(layer, "forward_stage5")
         fully_shard(model[i], mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
 
+    if init_device is not None:
+        with setup_phase("materialize the sharded parameters on %s (uninitialized)" % init_device):
+            materialize(model, init_device)
+
     # Sum, not average: the two classes reduce over groups of different size, yet each sum is the
     # global gradient, so the step's single divide by the global token count normalizes both.
     for module in model.modules():
@@ -358,7 +444,18 @@ def apply_fsdp(model, hsdp_replica: int = 1):
 def setup_model(
     cfg: TrainingCfg,
     distributed_cfg: DistributedCfg,
+    weights_from_checkpoint: bool = False,
 ) -> None:
+    """
+    Build this rank's two V-chunks, shard them and wrap them in the pipeline schedule.
+
+    By default the chunks are built on the CPU, initialized by init_weights and moved to the GPU by
+    FSDP. With weights_from_checkpoint the caller guarantees a load_checkpoint next, which
+    overwrites every parameter: the chunks are then built with their parameters on meta, sharded,
+    and materialized on the GPU uninitialized, which skips the full-model CPU build, both random
+    inits and the host-to-device copy. load_checkpoint then refuses a checkpoint that misses any
+    parameter, so none can keep the garbage.
+    """
     training.fp8 = cfg.fp8
     training.Linear = FP8Linear if cfg.fp8 else BF16Linear
     training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
@@ -394,12 +491,23 @@ def setup_model(
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
-    modules.append(ModelClass(module_config, phase=0))
-    modules.append(ModelClass(module_config, phase=1))
-
-    modules = nn.Sequential(*modules)
-    init_weights(modules, module_config.num_hidden_layers, cfg.init_std, cfg.seed)
-    apply_fsdp(modules, distributed_cfg.hsdp_replica)
+    build = (
+        "parameters on meta, a checkpoint load follows" if weights_from_checkpoint else "on the CPU"
+    )
+    with setup_phase("build the model chunks (%s)" % build):
+        with parameters_on_meta() if weights_from_checkpoint else nullcontext():
+            modules.append(ModelClass(module_config, phase=0))
+            modules.append(ModelClass(module_config, phase=1))
+        modules = nn.Sequential(*modules)
+    if weights_from_checkpoint:
+        log_setup("init_weights skipped, every parameter comes from the checkpoint")
+    else:
+        with setup_phase("init_weights"):
+            init_weights(modules, module_config.num_hidden_layers, cfg.init_std, cfg.seed)
+    init_device = distributed.device if weights_from_checkpoint else None
+    with setup_phase("apply_fsdp"):
+        apply_fsdp(modules, distributed_cfg.hsdp_replica, init_device=init_device)
+    training.weights_pending_load = weights_from_checkpoint
     install_wgrad_accumulation(modules)
     install_raw_main_grad(modules)  # gpt-oss raw expert weights; no-op elsewhere
 
@@ -542,12 +650,18 @@ def reload_training_state() -> None:
     training.offloaded = False
 
 
-def setup_training(cfg: object) -> None:
+def setup_training(cfg: object, weights_from_checkpoint: bool = False) -> None:
+    """
+    Build the model, optimizers and schedulers. weights_from_checkpoint promises a load_checkpoint
+    next and skips the weight initialization it would overwrite; see setup_model.
+    """
     assert hasattr(cfg, "training") and isinstance(cfg.training, TrainingCfg)
     random.seed(cfg.training.seed)
     np.random.seed(cfg.training.seed)
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
-    setup_model(cfg.training, cfg.distributed)
-    training.optimizers = cfg.training.optimizer(cfg.training)
-    training.schedulers = cfg.training.scheduler(cfg.training)
+    with setup_phase("total"):
+        setup_model(cfg.training, cfg.distributed, weights_from_checkpoint)
+        with setup_phase("optimizers and schedulers"):
+            training.optimizers = cfg.training.optimizer(cfg.training)
+            training.schedulers = cfg.training.scheduler(cfg.training)

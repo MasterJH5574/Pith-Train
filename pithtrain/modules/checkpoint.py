@@ -30,7 +30,7 @@ from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-from torch.distributed.checkpoint import FileSystemReader
+from torch.distributed.checkpoint import DefaultLoadPlanner, FileSystemReader
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_state_dict,
@@ -276,6 +276,7 @@ def iter_canonical_parameters() -> Iterator[Tuple[str, torch.Tensor]]:
     this rank's layers are yielded; joining pipeline stages is the caller's job.
     """
     assert not training.offloaded, "training state is offloaded; call reload_training_state"
+    assert not training.weights_pending_load, "the weights are uninitialized; call load_checkpoint"
     model = training.model
     named_modules = dict(model.named_modules())
     for localized_fqn, param in model.named_parameters():
@@ -447,9 +448,11 @@ class CheckpointState(Stateful):
         optimizers: tuple[Optimizer, ...],
         schedulers: tuple[LRScheduler, ...],
         model_only: bool = False,
+        strict: bool = False,
     ):
         self.model, self.optimizers, self.schedulers = model, optimizers, schedulers
         self.model_only = model_only
+        self.strict = strict
 
     def state_dict(self):
         """
@@ -482,8 +485,19 @@ class CheckpointState(Stateful):
 
         Released checkpoints from HuggingFace do not necessarily include optimizer and scheduler
         state, so those are skipped when missing.
+
+        With strict set, every key of the model's state dict must come from the checkpoint. DCP has
+        already refused a checkpoint missing a requested key; this also catches a key that does not
+        map back to the model, so no parameter keeps its previous, possibly uninitialized, value.
         """
         model_state = to_localized_model(state_dict["model"], self.model)
+        if self.strict:
+            missing = sorted(set(self.model.state_dict()) - set(model_state))
+            if missing:
+                raise RuntimeError(
+                    "Strict checkpoint load: %d model keys not loaded, e.g. %s"
+                    % (len(missing), missing[:5])
+                )
         optim_state = state_dict.get("optimizer")
         sched_state = state_dict.get("scheduler")
 
@@ -510,6 +524,7 @@ def save_checkpoint(root: Path, step: int) -> None:
     expert keys it owns. Non-expert DTensors stay as CPU DTensors and DCP saves each rank's shard.
     """
     assert not training.offloaded, "training state is offloaded; call reload_training_state"
+    assert not training.weights_pending_load, "the weights are uninitialized; call load_checkpoint"
     stdout = logging.stdout
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
     location = Path(root, "torch-dcp", "%08d" % step)
@@ -538,7 +553,7 @@ def save_checkpoint(root: Path, step: int) -> None:
     stdout.info("Save checkpoint: elapsed min=%.1fs, max=%.1fs" % (dt_min.item(), dt_max.item()))
 
 
-def load_checkpoint(root: Path, step: int) -> None:
+def load_checkpoint(root: Path, step: int, strict: bool = False) -> None:
     """
     Load the step checkpoint under root into the runtime state: the model, plus the optimizers and
     schedulers when the checkpoint carries them. One converted from HuggingFace carries model keys
@@ -548,26 +563,34 @@ def load_checkpoint(root: Path, step: int) -> None:
     Run position is never written. The step names a checkpoint, not where the caller is, and only
     the caller knows whether loading these weights means resuming its own run or filling a frozen
     slot such as an RL reference policy.
+
+    strict requires the checkpoint to fill every model key (see CheckpointState.load_state_dict).
+    It is forced after setup_model(weights_from_checkpoint=True), whose parameters are
+    uninitialized until this load succeeds.
     """
     assert not training.offloaded, "training state is offloaded; call reload_training_state"
     stdout = logging.stdout
     location = Path(root, "torch-dcp", "%08d" % step)
-    stdout.info("Load checkpoint: %s" % location)
+    strict = strict or training.weights_pending_load
+    stdout.info("Load checkpoint: %s%s" % (location, " (strict)" if strict else ""))
 
     t0 = time.monotonic()
     torch.cuda.empty_cache()
     metadata = FileSystemReader(str(location)).read_metadata()
     model_only = all(k.startswith("app.model.") for k in metadata.state_dict_metadata)
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
-    state = CheckpointState(model, optimizers, schedulers, model_only=model_only)
-    dcp.load({"app": state}, checkpoint_id=location)
+    state = CheckpointState(model, optimizers, schedulers, model_only=model_only, strict=strict)
+    # A partial load would leave the requested keys the checkpoint lacks as they were.
+    planner = DefaultLoadPlanner(allow_partial_load=False)
+    dcp.load({"app": state}, checkpoint_id=location, planner=planner)
+    training.weights_pending_load = False
     rank = torch.distributed.get_rank()
     rng_path = Path(location, "rng-rank-%05d.pt" % rank)
     if rng_path.exists():
         rng_state = torch.load(rng_path, weights_only=True)
         torch.cuda.set_rng_state(rng_state)
 
-    dt = torch.tensor(time.monotonic() - t0, device="cuda")
+    dt = torch.tensor(time.monotonic() - t0, device=distributed.device)
     dt_min, dt_max = dt.clone(), dt.clone()
     torch.distributed.all_reduce(dt_min, op=torch.distributed.ReduceOp.MIN)
     torch.distributed.all_reduce(dt_max, op=torch.distributed.ReduceOp.MAX)

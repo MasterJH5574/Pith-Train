@@ -20,6 +20,7 @@ __all__ = [
     "optimizers",
     "schedulers",
     "current_microbatch",
+    "weights_pending_load",
 ]
 
 PARAM_DTYPE = torch.bfloat16
@@ -69,4 +70,11 @@ True between offload_training_state and reload_training_state.
 
 Tensors keep their shapes over zero-byte device storages, so model.step, save_checkpoint,
 load_checkpoint and iter_canonical_parameters reject this state.
+"""
+
+
+weights_pending_load: bool = False
+"""
+Whether setup_model skipped initialization because a checkpoint load follows: the parameters hold
+uninitialized memory until load_checkpoint fills every one of them, strictly.
 """
